@@ -250,4 +250,16 @@ MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led
 // ============================================================================
 // [6] MicroPython 模块注册表
 // ============================================================================
-STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table
+STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
+};
+STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
+
+const mp_obj_type_t Maix_mic_array_type = {
+    { &mp_type_type },
+    .name = MP_QSTR_MIC_ARRAY,
+    .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict,
+};

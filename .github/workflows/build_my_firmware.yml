@@ -10,24 +10,28 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: 1. Pull Code
+    - name: 1. Pull Code (Full Clone)
       uses: actions/checkout@v4
       with:
-        submodules: 'recursive'
+        fetch-depth: 0  # 关键修复1：关闭浅层下载，下载全部历史记录
 
-    - name: 2. Install Dependencies
+    - name: 2. Pull Submodules Manually
+      # 关键修复2：手动用最传统、最老实的方法拉取子模块，那个老服务器就认这个
+      run: git submodule update --init --recursive 
+
+    - name: 3. Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake wget python3 python3-pip git gcc-9 g++-9
         pip3 install intelhex --break-system-packages || pip3 install intelhex
 
-    - name: 3. Download Toolchain
+    - name: 4. Download Toolchain
       run: |
         wget https://github.com/kendryte/kendryte-gnu-toolchain/releases/download/v8.2.0-20190409/kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz
         sudo tar -Jxf kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz -C /opt
         echo "/opt/kendryte-toolchain/bin" >> $GITHUB_PATH
 
-    - name: 4. Build Firmware
+    - name: 5. Build Firmware
       run: |
         export CC=gcc-9
         export CXX=g++-9
@@ -35,7 +39,7 @@ jobs:
         python3 project.py clean
         python3 project.py build
 
-    - name: 5. Upload Bin File
+    - name: 6. Upload Bin File
       uses: actions/upload-artifact@v4
       with:
         name: Custom_MaixPy_Firmware

@@ -10,33 +10,32 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: 1. 拉取代码 (包含子模块)
+    - name: 1. Pull Code
       uses: actions/checkout@v4
       with:
         submodules: 'recursive'
 
-    - name: 2. 安装环境依赖与旧版编译器 (专门防报错)
+    - name: 2. Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake wget python3 python3-pip git gcc-9 g++-9
         pip3 install intelhex --break-system-packages || pip3 install intelhex
 
-    - name: 3. 下载 K210 官方编译工具链
+    - name: 3. Download Toolchain
       run: |
         wget https://github.com/kendryte/kendryte-gnu-toolchain/releases/download/v8.2.0-20190409/kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz
         sudo tar -Jxf kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz -C /opt
         echo "/opt/kendryte-toolchain/bin" >> $GITHUB_PATH
 
-    - name: 4. 编译 MaixPy 固件
+    - name: 4. Build Firmware
       run: |
-        # 强制底层代码使用刚刚安装的旧版本 gcc-9 编译，完美避开严格检查
         export CC=gcc-9
         export CXX=g++-9
         cd projects/maixpy_k210
         python3 project.py clean
         python3 project.py build
 
-    - name: 5. 提取并上传生成的 Bin 文件供下载
+    - name: 5. Upload Bin File
       uses: actions/upload-artifact@v4
       with:
         name: Custom_MaixPy_Firmware

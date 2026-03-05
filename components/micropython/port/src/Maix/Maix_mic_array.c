@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>     // 必须包含此头文件以支持 uint32_t
 
 // MicroPython 与 MaixPy 底层依赖
 #include "py/obj.h"
@@ -59,14 +60,14 @@ STATIC void init_mic_array_geometry() {
 // ============================================================================
 // [2] 极客性能优化层：快速数学运算
 // ============================================================================
-// 快速平方根倒数 (用于取代 GCC-PHAT 中极度耗时的开方与除法)
+// 修复后的 64位安全版 快速平方根倒数 (用于取代 GCC-PHAT 中极度耗时的开方与除法)
 STATIC inline float Q_rsqrt(float number) {
-    long i;
+    uint32_t i; // 必须用严格的 32 位无符号整型
     float x2, y;
     const float threehalfs = 1.5F;
     x2 = number * 0.5F;
     y  = number;
-    i  = * ( long * ) &y;
+    i  = * ( uint32_t * ) &y; // 这里绝对不能用 long
     i  = 0x5f3759df - ( i >> 1 );
     y  = * ( float * ) &i;
     y  = y * ( threehalfs - ( x2 * y * y ) );
@@ -249,16 +250,4 @@ MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led
 // ============================================================================
 // [6] MicroPython 模块注册表
 // ============================================================================
-STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
-    { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
-    { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
-    { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
-};
-STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
-
-const mp_obj_type_t Maix_mic_array_type = {
-    { &mp_type_type },
-    .name = MP_QSTR_MIC_ARRAY,
-    .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict,
-};
+STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table

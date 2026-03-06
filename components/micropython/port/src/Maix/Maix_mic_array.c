@@ -141,8 +141,8 @@ static float calculate_median(float* array, int size) {
 
 // 4. M-估计核心测向流水线
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N]; // 新增 static
-    static float mic_imag[NUM_MICS][FFT_N]; // 新增 static
+    static float mic_real[NUM_MICS][FFT_N]; // 静态分配防止栈溢出
+    static float mic_imag[NUM_MICS][FFT_N]; // 静态分配防止栈溢出
     
     // 加窗与正向 FFT
     for (int m = 0; m < NUM_MICS; m++) {
@@ -154,9 +154,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    float Meas_TDOA[NUM_PAIRS] = {0};       // 这两个很小，不用加
+    float Meas_TDOA[NUM_PAIRS] = {0};
     float Qual_Score[NUM_PAIRS] = {0};
-    static float R_real[FFT_N], R_imag[FFT_N]; // 新增 static
+    static float R_real[FFT_N], R_imag[FFT_N];
 
     // GCC-PHAT 计算
     int k = 0;
@@ -301,6 +301,13 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     sipeed_init_mic_array_led();
 
+    // ==========================================================
+    // 核心修复点：给 I2S 硬件上电并提供时钟信号
+    // ==========================================================
+    sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ); 
+    sysctl_clock_enable(SYSCTL_CLOCK_I2S0);
+    // ==========================================================
+
     // 纯硬件级 I2S 初始化
     i2s_init(I2S_DEVICE_0, I2S_RECEIVER, 0x0F);
     for(int i = 0; i < 4; i++){
@@ -312,11 +319,12 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     init_array_geometry();
 
-// 先独立注册 DMA 中断回调函数 (优先级设为 3)
+    // 先独立注册 DMA 中断回调函数 (优先级设为 3)
     dmac_set_irq(DMAC_CHANNEL4, i2s_dma_cb, NULL, 3);
     
     // 再开启非阻塞 DMA 录音 (只传 4 个参数)
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
+    
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
@@ -359,7 +367,7 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
         mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
     }
 
-// 立即重启 DMA (只传 4 个参数)
+    // 立即重启 DMA (只传 4 个参数)
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
     // 运行硬核管线

@@ -36,6 +36,7 @@
 #define NUM_PAIRS 21
 #define SAMPLE_RATE 48000.0f
 #define SOUND_SPEED 343.0f
+#undef PI
 #define PI 3.14159265358979323846f
 #define DEG2RAD (PI / 180.0f)
 
@@ -311,9 +312,11 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     init_array_geometry();
 
-    // 开启非阻塞 DMA 录音
-    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4, i2s_dma_cb, NULL);
-
+// 先独立注册 DMA 中断回调函数 (优先级设为 3)
+    dmac_set_irq(DMAC_CHANNEL4, i2s_dma_cb, NULL, 3);
+    
+    // 再开启非阻塞 DMA 录音 (只传 4 个参数)
+    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
@@ -356,8 +359,8 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
         mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
     }
 
-    // 立即重启 DMA
-    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4, i2s_dma_cb, NULL);
+// 立即重启 DMA (只传 4 个参数)
+    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
     // 运行硬核管线
     float final_angle = run_doa_pipeline(mic_raw_float);

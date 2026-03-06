@@ -28,7 +28,7 @@
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：核心宏定义、结构体与全局变量 (控制变量：严格保持一致)
+// 第一部分：核心宏定义、结构体与全局变量 (严格保持一致)
 // ============================================================================
 
 #define FFT_N 1024
@@ -59,7 +59,6 @@ float mic_raw_float[NUM_MICS][FFT_N];
 // 第二部分：纯 C 语言硬核数学与信号处理管线
 // ============================================================================
 
-// 1. 初始化阵列物理拓扑
 static void init_array_geometry(void) {
     float R = 0.04f;
     float theta_mic[6] = {0, 60, 120, 180, 240, 300};
@@ -84,7 +83,6 @@ static void init_array_geometry(void) {
     }
 }
 
-// 2. 1024 点基带 FFT (Cooley-Tukey)
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     int i, j, k, l;
     float tx, ty, u1, u2, z;
@@ -124,13 +122,13 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 }
 
 // ============================================================================
-// 算法 1：Baseline - TDOA Grid Search (网格搜索法核心)
+// 算法 2：Baseline - SRP-PHAT (频域扫描，严格对标 MATLAB 仿真逻辑)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N]; // 静态分配防止栈溢出
-    static float mic_imag[NUM_MICS][FFT_N]; // 静态分配防止栈溢出
+    static float mic_real[NUM_MICS][FFT_N]; 
+    static float mic_imag[NUM_MICS][FFT_N]; 
     
-    // 1. 加窗与正向 FFT
+    // 1. 加窗与正向 FFT (获取 X 和 Y)
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
             float window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -140,75 +138,79 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    float Meas_TDOA[NUM_PAIRS] = {0};
-    float Qual_Score[NUM_PAIRS] = {0};
-    static float R_real[FFT_N], R_imag[FFT_N];
+    // 确定有效的宽带频率范围 (对应 MATLAB: freqs_srp >= 50 & freqs_srp <= 8000)
+    float df = SAMPLE_RATE / FFT_N;  // 频率分辨率约 46.875 Hz
+    int start_bin = (int)ceilf(50.0f / df);    // 约 bin 2
+    int end_bin = (int)floorf(8000.0f / df);   // 约 bin 170
+    int num_valid_bins = end_bin - start_bin + 1;
 
-    // 2. GCC-PHAT 计算到达时间差 (与本文算法绝对一致的前提)
+    // 分配静态内存存储 R_phat_valid 矩阵 (21对麦克风 x 有效频点)
+    static float R_phat_r[NUM_PAIRS][FFT_N / 2];
+    static float R_phat_i[NUM_PAIRS][FFT_N / 2];
+
+    // 2. 提取有效频段的互相关归一化相位 (R_phat_valid)
     int k = 0;
     for (int u = 0; u < NUM_MICS; u++) {
         for (int v = u + 1; v < NUM_MICS; v++) {
-            for (int i = 0; i < FFT_N; i++) {
-                float cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
-                float cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
+            for (int bin = start_bin; bin <= end_bin; bin++) {
+                // R_xy = X .* conj(Y)
+                float cross_r = mic_real[u][bin] * mic_real[v][bin] + mic_imag[u][bin] * mic_imag[v][bin];
+                float cross_i = mic_imag[u][bin] * mic_real[v][bin] - mic_real[u][bin] * mic_imag[v][bin];
+                
+                // R_phat = R_xy ./ (abs(R_xy) + 1e-9)
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag;
-                R_imag[i] = cross_i / mag;
+                R_phat_r[k][bin] = cross_r / mag;
+                R_phat_i[k][bin] = cross_i / mag;
             }
-            fft_radix2(R_real, R_imag, FFT_N, 1);
-
-            float max_val = 0; int max_idx = 0;
-            int search_range = 8; 
-            for (int i = 0; i <= search_range; i++) {
-                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
-            }
-            for (int i = FFT_N - search_range; i < FFT_N; i++) {
-                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
-            }
-
-            float delta = 0;
-            if (max_idx > 0 && max_idx < FFT_N - 1) {
-                float y1 = R_real[max_idx - 1];
-                float y2 = R_real[max_idx];
-                float y3 = R_real[max_idx + 1];
-                float denom = 2.0f * (y1 - 2.0f * y2 + y3);
-                if (fabsf(denom) > 1e-9f) delta = (y1 - y3) / denom;
-            }
-            
-            float tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
-            Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
-            Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
             k++;
         }
     }
 
-    // 3. 核心差异：全空间粗网格搜索 (Grid Search) 替代 GN 微调
-    float min_cost = FLT_MAX;
+    // 3. 核心计算：频域空间扫描 (极其消耗算力，严格按照 MATLAB 双重循环展开)
+    float max_srp_energy = -FLT_MAX;
     float best_ang = 0.0f;
+
     for (int theta = -180; theta < 180; theta++) {
-        float cost = 0.0f;
+        float e_sum = 0.0f;
         float cos_t = cosf(theta * DEG2RAD);
         float sin_t = sinf(theta * DEG2RAD);
+
         for (int p = 0; p < NUM_PAIRS; p++) {
-            if (Qual_Score[p] < 1e-3f) continue;
+            // 计算理论 TDOA
             float theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
-            float err = theo_tdoa - Meas_TDOA[p];
-            cost += Qual_Score[p] * pair_conf[p].dist * err * err;
+            
+            // 对每个有效频段累加：real( R_phat_valid .* exp(1j * omega * theo_tdoa) )
+            for (int bin = start_bin; bin <= end_bin; bin++) {
+                float freq = bin * df;
+                float omega = 2.0f * PI * freq;
+                
+                // 导向矢量 steer = exp(j * omega * theo_tdoa)
+                float phase = omega * theo_tdoa;
+                float steer_r = cosf(phase);
+                float steer_i = sinf(phase);
+                
+                // 复数相乘的实部: real( (R_r + j R_i) * (steer_r + j steer_i) )
+                // = R_r * steer_r - R_i * steer_i
+                e_sum += (R_phat_r[p][bin] * steer_r - R_phat_i[p][bin] * steer_i);
+            }
         }
-        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
+
+        if (e_sum > max_srp_energy) {
+            max_srp_energy = e_sum;
+            best_ang = (float)theta;
+        }
     }
 
-    // Baseline 直接输出网格搜索的最优解
+    // 格式化输出角度
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
     if (final_ang < 0) final_ang += 360.0f;
     return final_ang - 180.0f;
 }
 
 // ============================================================================
-// 第三部分：MicroPython 底层接口绑定 (与 M-估计版本完全一致)
+// 第三部分：MicroPython 底层接口绑定 (与系统保持一致)
 // ============================================================================
 
-// DMA 接收中断回调
 static int i2s_dma_cb(void *ctx) {
     rx_flag = 1;
     return 0;
@@ -245,11 +247,9 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     sipeed_init_mic_array_led();
 
-    // 核心修复点：给 I2S 硬件上电并提供时钟信号
     sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ); 
     sysctl_clock_enable(SYSCTL_CLOCK_I2S0);
 
-    // 纯硬件级 I2S 初始化
     i2s_init(I2S_DEVICE_0, I2S_RECEIVER, 0x0F);
     for(int i = 0; i < 4; i++){
         i2s_rx_channel_config(I2S_DEVICE_0, I2S_CHANNEL_0 + i,
@@ -260,7 +260,6 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     init_array_geometry();
 
-    // 注册 DMA 中断并开启传输
     dmac_set_irq(DMAC_CHANNEL4, i2s_dma_cb, NULL, 3);
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
     
@@ -279,7 +278,6 @@ STATIC mp_obj_t Maix_mic_array_get_map(void) {
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_map_obj, Maix_mic_array_get_map);
 
-// 获取高精度波达角的 Python 接口 (无参数)
 STATIC mp_obj_t Maix_mic_array_get_dir(void)
 {
     volatile uint8_t retry = 100;
@@ -295,7 +293,6 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
     }
     rx_flag = 0;
 
-    // 解包 I2S 交织数据
     for (int i = 0; i < FFT_N; i++) {
         mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
         mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
@@ -306,17 +303,14 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
         mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
     }
 
-    // 重启 DMA
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 运行 Baseline 1 管线
     float final_angle = run_doa_pipeline(mic_raw_float);
 
     return mp_obj_new_float(final_angle);
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_dir_obj, Maix_mic_array_get_dir);
 
-// LED 环控制保持不变
 STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
     int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0};
@@ -344,7 +338,6 @@ STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, 
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);
 
-// 注册字典
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },

@@ -122,12 +122,13 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 }
 
 // ============================================================================
-// 算法 2：Baseline - SRP-PHAT (修复底层 FFT 共轭反向问题)
+// 算法 3：Baseline - Broadband MUSIC (严格对标 MATLAB 协方差与子空间分解)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     
+    // 1. 加窗与正向 FFT
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
             float window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -137,61 +138,125 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    float df = SAMPLE_RATE / FFT_N;  
-    int start_bin = (int)ceilf(50.0f / df);    
-    int end_bin = (int)floorf(8000.0f / df);   
+    // 重新定义麦克风坐标 (用于导向矢量 a)
+    float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
+    for (int i = 0; i < 6; i++) {
+        mic_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
+        mic_pos_y[i] = 0.04f * sinf(i * 60.0f * DEG2RAD);
+    }
+    mic_pos_x[6] = 0.0f; mic_pos_y[6] = 0.0f;
 
-    static float R_phat_r[NUM_PAIRS][FFT_N / 2];
-    static float R_phat_i[NUM_PAIRS][FFT_N / 2];
+    // 对应 MATLAB: valid_bins_stft = find(freqs_stft >= 50 & freqs_stft <= 8000)
+    float df = SAMPLE_RATE / FFT_N;
+    int start_bin = (int)ceilf(50.0f / df);
+    int end_bin = (int)floorf(8000.0f / df);
 
-    int k = 0;
-    for (int u = 0; u < NUM_MICS; u++) {
-        for (int v = u + 1; v < NUM_MICS; v++) {
-            for (int bin = start_bin; bin <= end_bin; bin++) {
-                // 注意：这里的 cross_i 取出来后，符号实际上是 MATLAB 的相反数
-                float cross_r = mic_real[u][bin] * mic_real[v][bin] + mic_imag[u][bin] * mic_imag[v][bin];
-                float cross_i = mic_imag[u][bin] * mic_real[v][bin] - mic_real[u][bin] * mic_imag[v][bin];
-                
-                float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_phat_r[k][bin] = cross_r / mag;
-                R_phat_i[k][bin] = cross_i / mag;
+    static float P_MUSIC[360] = {0};
+    for (int i = 0; i < 360; i++) P_MUSIC[i] = 0.0f;
+
+    // 2. 遍历每一个有效频点，执行 MUSIC 空间谱累加
+    for (int bin = start_bin; bin <= end_bin; bin++) {
+        float freq = bin * df;
+        float omega = 2.0f * PI * freq;
+
+        // --- A. 建立 7x7 复数协方差矩阵 Rxx = X * X^H ---
+        float Rxx_r[NUM_MICS][NUM_MICS] = {0};
+        float Rxx_i[NUM_MICS][NUM_MICS] = {0};
+        for (int i = 0; i < NUM_MICS; i++) {
+            for (int j = 0; j < NUM_MICS; j++) {
+                Rxx_r[i][j] = mic_real[i][bin] * mic_real[j][bin] + mic_imag[i][bin] * mic_imag[j][bin];
+                Rxx_i[i][j] = mic_imag[i][bin] * mic_real[j][bin] - mic_real[i][bin] * mic_imag[j][bin];
             }
-            k++;
+        }
+
+        // --- B. 幂迭代法 (Power Iteration) 求解主特征向量 (Signal Subspace) ---
+        // 这完美等效于 MATLAB 中 eig(Rxx) 提取的主特征向量
+        float V_r[NUM_MICS] = {1, 1, 1, 1, 1, 1, 1}; // 初始化向量
+        float V_i[NUM_MICS] = {0, 0, 0, 0, 0, 0, 0};
+        
+        for (int iter = 0; iter < 10; iter++) {
+            float V_new_r[NUM_MICS] = {0};
+            float V_new_i[NUM_MICS] = {0};
+            float norm_sq = 0.0f;
+            
+            // 矩阵乘矢量: V_new = Rxx * V
+            for (int i = 0; i < NUM_MICS; i++) {
+                for (int j = 0; j < NUM_MICS; j++) {
+                    V_new_r[i] += (Rxx_r[i][j] * V_r[j] - Rxx_i[i][j] * V_i[j]);
+                    V_new_i[i] += (Rxx_r[i][j] * V_i[j] + Rxx_i[i][j] * V_r[j]);
+                }
+                norm_sq += (V_new_r[i] * V_new_r[i] + V_new_i[i] * V_new_i[i]);
+            }
+            
+            // 归一化
+            float norm = sqrtf(norm_sq) + 1e-12f;
+            for (int i = 0; i < NUM_MICS; i++) {
+                V_r[i] = V_new_r[i] / norm;
+                V_i[i] = V_new_i[i] / norm;
+            }
+        }
+
+        // --- C. 构建噪声子空间投影矩阵 Pn = I - V*V^H ---
+        // 等价于 MATLAB 中的 Un * Un'
+        float Pn_r[NUM_MICS][NUM_MICS];
+        float Pn_i[NUM_MICS][NUM_MICS];
+        for (int i = 0; i < NUM_MICS; i++) {
+            for (int j = 0; j < NUM_MICS; j++) {
+                float vvH_r = V_r[i] * V_r[j] + V_i[i] * V_i[j];
+                float vvH_i = V_i[i] * V_r[j] - V_r[i] * V_i[j];
+                
+                if (i == j) {
+                    Pn_r[i][j] = 1.0f - vvH_r;
+                    Pn_i[i][j] = -vvH_i;
+                } else {
+                    Pn_r[i][j] = -vvH_r;
+                    Pn_i[i][j] = -vvH_i;
+                }
+            }
+        }
+
+        // --- D. 空间谱扫描 P_music = 1 / (a^H * Pn * a) ---
+        for (int theta = -180; theta < 180; theta++) {
+            float cos_t = cosf(theta * DEG2RAD);
+            float sin_t = sinf(theta * DEG2RAD);
+            
+            // 构造导向矢量 a
+            float a_r[NUM_MICS], a_i[NUM_MICS];
+            for (int m = 0; m < NUM_MICS; m++) {
+                float phase = omega * (mic_pos_x[m] * cos_t + mic_pos_y[m] * sin_t) / SOUND_SPEED;
+                a_r[m] = cosf(phase);
+                a_i[m] = sinf(phase); // MATLAB 的 exp(1j * phase)
+            }
+            
+            // 计算 y = Pn * a
+            float y_r[NUM_MICS] = {0}, y_i[NUM_MICS] = {0};
+            for (int i = 0; i < NUM_MICS; i++) {
+                for (int j = 0; j < NUM_MICS; j++) {
+                    y_r[i] += (Pn_r[i][j] * a_r[j] - Pn_i[i][j] * a_i[j]);
+                    y_i[i] += (Pn_r[i][j] * a_i[j] + Pn_i[i][j] * a_r[j]);
+                }
+            }
+            
+            // 计算分母 val = a^H * y (由于 Pn 是厄米特矩阵，结果必定为实数)
+            float val_r = 0.0f;
+            for (int i = 0; i < NUM_MICS; i++) {
+                // a^H * y 的实部: a_r * y_r + (-a_i) * (-y_i) -> 错，应该是 a_r * y_r + a_i * y_i
+                val_r += (a_r[i] * y_r[i] + a_i[i] * y_i[i]);
+            }
+            
+            // 累加宽带空间谱
+            int theta_idx = theta + 180;
+            P_MUSIC[theta_idx] += 1.0f / (val_r + 1e-12f);
         }
     }
 
-    float max_srp_energy = -FLT_MAX;
-    float best_ang = 0.0f;
-
-    for (int theta = -180; theta < 180; theta++) {
-        float e_sum = 0.0f;
-        float cos_t = cosf(theta * DEG2RAD);
-        float sin_t = sinf(theta * DEG2RAD);
-
-        for (int p = 0; p < NUM_PAIRS; p++) {
-            float theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
-            
-            for (int bin = start_bin; bin <= end_bin; bin++) {
-                float freq = bin * df;
-                float omega = 2.0f * PI * freq;
-                
-                float phase = omega * theo_tdoa;
-                float steer_r = cosf(phase);
-                float steer_i = sinf(phase);
-                
-                // -----------------------------------------------------------------
-                // 【核心修复】: 
-                // 标准公式应为 R_r * steer_r - R_i * steer_i。
-                // 因为底层 FFT 导致 R_phat_i 的符号被反转，这里必须改为加号 (+)，
-                // 从而抵消共轭误差，与 MATLAB 的 real(R .* exp(j*omega*tau)) 绝对对齐！
-                // -----------------------------------------------------------------
-                e_sum += (R_phat_r[p][bin] * steer_r + R_phat_i[p][bin] * steer_i);
-            }
-        }
-
-        if (e_sum > max_srp_energy) {
-            max_srp_energy = e_sum;
-            best_ang = (float)theta;
+    // 3. 在空间谱中寻找峰值
+    float max_P = 0;
+    float best_ang = 0;
+    for (int i = 0; i < 360; i++) {
+        if (P_MUSIC[i] > max_P) {
+            max_P = P_MUSIC[i];
+            best_ang = (float)(i - 180);
         }
     }
 

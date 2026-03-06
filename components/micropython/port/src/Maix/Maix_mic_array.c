@@ -141,8 +141,8 @@ static float calculate_median(float* array, int size) {
 
 // 4. M-估计核心测向流水线
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    float mic_real[NUM_MICS][FFT_N];
-    float mic_imag[NUM_MICS][FFT_N];
+    static float mic_real[NUM_MICS][FFT_N]; // 新增 static
+    static float mic_imag[NUM_MICS][FFT_N]; // 新增 static
     
     // 加窗与正向 FFT
     for (int m = 0; m < NUM_MICS; m++) {
@@ -154,9 +154,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    float Meas_TDOA[NUM_PAIRS] = {0};
+    float Meas_TDOA[NUM_PAIRS] = {0};       // 这两个很小，不用加
     float Qual_Score[NUM_PAIRS] = {0};
-    float R_real[FFT_N], R_imag[FFT_N];
+    static float R_real[FFT_N], R_imag[FFT_N]; // 新增 static
 
     // GCC-PHAT 计算
     int k = 0;

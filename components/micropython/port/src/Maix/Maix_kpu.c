@@ -566,8 +566,7 @@ static void py_kpu_class_yolo2_print(const mp_print_t *print, mp_obj_t self_in, 
     {
         sprintf(msg,"%f",rl_arg->anchor[0]);
         for(uint16_t i = 1; i < num * 2; i++)
-            int current_len = strlen(msg);
-snprintf(msg + current_len, sizeof(msg) - current_len, ", %f", rl_arg->anchor[i]);
+           { int current_len = strlen(msg); snprintf(msg + current_len, sizeof(msg) - current_len, ", %f", rl_arg->anchor[i]); }
     }
 
     mp_printf(print,
@@ -625,7 +624,7 @@ static int py_kpu_class_yolo2_print_to_buf(mp_obj_t self_in, char *buf)
         {
             sprintf(msg,"%f",rl_arg->anchor[0]);
             for(uint16_t i = 1; i < num * 2; i++)
-                snprintf(msg, sizeof(msg), "%s, %f",msg, rl_arg->anchor[i]);
+               { int current_len = strlen(msg); snprintf(msg + current_len, sizeof(msg) - current_len, ", %f", rl_arg->anchor[i]); }
         }
 
         sprintf(buf,

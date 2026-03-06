@@ -122,13 +122,12 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 }
 
 // ============================================================================
-// 算法 2：Baseline - SRP-PHAT (频域扫描，严格对标 MATLAB 仿真逻辑)
+// 算法 2：Baseline - SRP-PHAT (修复底层 FFT 共轭反向问题)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     
-    // 1. 加窗与正向 FFT (获取 X 和 Y)
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
             float window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -138,26 +137,21 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 确定有效的宽带频率范围 (对应 MATLAB: freqs_srp >= 50 & freqs_srp <= 8000)
-    float df = SAMPLE_RATE / FFT_N;  // 频率分辨率约 46.875 Hz
-    int start_bin = (int)ceilf(50.0f / df);    // 约 bin 2
-    int end_bin = (int)floorf(8000.0f / df);   // 约 bin 170
-    int num_valid_bins = end_bin - start_bin + 1;
+    float df = SAMPLE_RATE / FFT_N;  
+    int start_bin = (int)ceilf(50.0f / df);    
+    int end_bin = (int)floorf(8000.0f / df);   
 
-    // 分配静态内存存储 R_phat_valid 矩阵 (21对麦克风 x 有效频点)
     static float R_phat_r[NUM_PAIRS][FFT_N / 2];
     static float R_phat_i[NUM_PAIRS][FFT_N / 2];
 
-    // 2. 提取有效频段的互相关归一化相位 (R_phat_valid)
     int k = 0;
     for (int u = 0; u < NUM_MICS; u++) {
         for (int v = u + 1; v < NUM_MICS; v++) {
             for (int bin = start_bin; bin <= end_bin; bin++) {
-                // R_xy = X .* conj(Y)
+                // 注意：这里的 cross_i 取出来后，符号实际上是 MATLAB 的相反数
                 float cross_r = mic_real[u][bin] * mic_real[v][bin] + mic_imag[u][bin] * mic_imag[v][bin];
                 float cross_i = mic_imag[u][bin] * mic_real[v][bin] - mic_real[u][bin] * mic_imag[v][bin];
                 
-                // R_phat = R_xy ./ (abs(R_xy) + 1e-9)
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
                 R_phat_r[k][bin] = cross_r / mag;
                 R_phat_i[k][bin] = cross_i / mag;
@@ -166,7 +160,6 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    // 3. 核心计算：频域空间扫描 (极其消耗算力，严格按照 MATLAB 双重循环展开)
     float max_srp_energy = -FLT_MAX;
     float best_ang = 0.0f;
 
@@ -176,22 +169,23 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         float sin_t = sinf(theta * DEG2RAD);
 
         for (int p = 0; p < NUM_PAIRS; p++) {
-            // 计算理论 TDOA
             float theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
             
-            // 对每个有效频段累加：real( R_phat_valid .* exp(1j * omega * theo_tdoa) )
             for (int bin = start_bin; bin <= end_bin; bin++) {
                 float freq = bin * df;
                 float omega = 2.0f * PI * freq;
                 
-                // 导向矢量 steer = exp(j * omega * theo_tdoa)
                 float phase = omega * theo_tdoa;
                 float steer_r = cosf(phase);
                 float steer_i = sinf(phase);
                 
-                // 复数相乘的实部: real( (R_r + j R_i) * (steer_r + j steer_i) )
-                // = R_r * steer_r - R_i * steer_i
-                e_sum += (R_phat_r[p][bin] * steer_r - R_phat_i[p][bin] * steer_i);
+                // -----------------------------------------------------------------
+                // 【核心修复】: 
+                // 标准公式应为 R_r * steer_r - R_i * steer_i。
+                // 因为底层 FFT 导致 R_phat_i 的符号被反转，这里必须改为加号 (+)，
+                // 从而抵消共轭误差，与 MATLAB 的 real(R .* exp(j*omega*tau)) 绝对对齐！
+                // -----------------------------------------------------------------
+                e_sum += (R_phat_r[p][bin] * steer_r + R_phat_i[p][bin] * steer_i);
             }
         }
 
@@ -201,12 +195,10 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    // 格式化输出角度
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
     if (final_ang < 0) final_ang += 360.0f;
     return final_ang - 180.0f;
 }
-
 // ============================================================================
 // 第三部分：MicroPython 底层接口绑定 (与系统保持一致)
 // ============================================================================

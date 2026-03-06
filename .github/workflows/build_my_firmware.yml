@@ -13,10 +13,9 @@ jobs:
     - name: 1. Pull Code (Full Clone)
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # 关键修复1：关闭浅层下载，下载全部历史记录
+        fetch-depth: 0 
 
     - name: 2. Pull Submodules Manually
-      # 关键修复2：手动用最传统、最老实的方法拉取子模块，那个老服务器就认这个
       run: git submodule update --init --recursive 
 
     - name: 3. Install Dependencies
@@ -31,11 +30,16 @@ jobs:
         sudo tar -Jxf kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz -C /opt
         echo "/opt/kendryte-toolchain/bin" >> $GITHUB_PATH
 
-    - name: 5. Build Firmware
+    - name: 5. Build Firmware (Forced IDE Support)
       run: |
         export CC=gcc-9
         export CXX=g++-9
         cd projects/maixpy_k210
+        
+        # --- 核心修复：强行向编译配置中注入 IDE 和显示屏支持开关 ---
+        echo "CONFIG_MAIXPY_IDE_SUPPORT=y" >> config_defaults.mk
+        echo "CONFIG_MAIXPY_DISPLAY_SUPPORT=y" >> config_defaults.mk
+        
         python3 project.py clean
         python3 project.py build
 

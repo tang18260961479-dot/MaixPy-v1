@@ -122,7 +122,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 }
 
 // ============================================================================
-// 算法 3：Baseline - Broadband MUSIC (严格对标 MATLAB 协方差与子空间分解)
+// 算法 3：Baseline - Broadband MUSIC (修复协方差矩阵共轭反转)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
@@ -138,7 +138,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 重新定义麦克风坐标 (用于导向矢量 a)
+    // 麦克风物理坐标系
     float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
     for (int i = 0; i < 6; i++) {
         mic_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
@@ -146,7 +146,6 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     }
     mic_pos_x[6] = 0.0f; mic_pos_y[6] = 0.0f;
 
-    // 对应 MATLAB: valid_bins_stft = find(freqs_stft >= 50 & freqs_stft <= 8000)
     float df = SAMPLE_RATE / FFT_N;
     int start_bin = (int)ceilf(50.0f / df);
     int end_bin = (int)floorf(8000.0f / df);
@@ -164,14 +163,19 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         float Rxx_i[NUM_MICS][NUM_MICS] = {0};
         for (int i = 0; i < NUM_MICS; i++) {
             for (int j = 0; j < NUM_MICS; j++) {
+                // 实部保持不变
                 Rxx_r[i][j] = mic_real[i][bin] * mic_real[j][bin] + mic_imag[i][bin] * mic_imag[j][bin];
-                Rxx_i[i][j] = mic_imag[i][bin] * mic_real[j][bin] - mic_real[i][bin] * mic_imag[j][bin];
+                
+                // -----------------------------------------------------------------
+                // 【核心修复】：由于 FFT 虚部自带负号，真实的 Rxx 虚部计算公式中，
+                // mic_real 和 mic_imag 的位置必须如下排列，才能与 MATLAB 完全对齐！
+                // -----------------------------------------------------------------
+                Rxx_i[i][j] = mic_real[i][bin] * mic_imag[j][bin] - mic_imag[i][bin] * mic_real[j][bin];
             }
         }
 
-        // --- B. 幂迭代法 (Power Iteration) 求解主特征向量 (Signal Subspace) ---
-        // 这完美等效于 MATLAB 中 eig(Rxx) 提取的主特征向量
-        float V_r[NUM_MICS] = {1, 1, 1, 1, 1, 1, 1}; // 初始化向量
+        // --- B. 幂迭代法求解主特征向量 (Signal Subspace) ---
+        float V_r[NUM_MICS] = {1, 1, 1, 1, 1, 1, 1}; 
         float V_i[NUM_MICS] = {0, 0, 0, 0, 0, 0, 0};
         
         for (int iter = 0; iter < 10; iter++) {
@@ -179,7 +183,6 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             float V_new_i[NUM_MICS] = {0};
             float norm_sq = 0.0f;
             
-            // 矩阵乘矢量: V_new = Rxx * V
             for (int i = 0; i < NUM_MICS; i++) {
                 for (int j = 0; j < NUM_MICS; j++) {
                     V_new_r[i] += (Rxx_r[i][j] * V_r[j] - Rxx_i[i][j] * V_i[j]);
@@ -188,7 +191,6 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
                 norm_sq += (V_new_r[i] * V_new_r[i] + V_new_i[i] * V_new_i[i]);
             }
             
-            // 归一化
             float norm = sqrtf(norm_sq) + 1e-12f;
             for (int i = 0; i < NUM_MICS; i++) {
                 V_r[i] = V_new_r[i] / norm;
@@ -197,7 +199,6 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
 
         // --- C. 构建噪声子空间投影矩阵 Pn = I - V*V^H ---
-        // 等价于 MATLAB 中的 Un * Un'
         float Pn_r[NUM_MICS][NUM_MICS];
         float Pn_i[NUM_MICS][NUM_MICS];
         for (int i = 0; i < NUM_MICS; i++) {
@@ -220,15 +221,13 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             float cos_t = cosf(theta * DEG2RAD);
             float sin_t = sinf(theta * DEG2RAD);
             
-            // 构造导向矢量 a
             float a_r[NUM_MICS], a_i[NUM_MICS];
             for (int m = 0; m < NUM_MICS; m++) {
                 float phase = omega * (mic_pos_x[m] * cos_t + mic_pos_y[m] * sin_t) / SOUND_SPEED;
                 a_r[m] = cosf(phase);
-                a_i[m] = sinf(phase); // MATLAB 的 exp(1j * phase)
+                a_i[m] = sinf(phase); 
             }
             
-            // 计算 y = Pn * a
             float y_r[NUM_MICS] = {0}, y_i[NUM_MICS] = {0};
             for (int i = 0; i < NUM_MICS; i++) {
                 for (int j = 0; j < NUM_MICS; j++) {
@@ -237,20 +236,17 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
                 }
             }
             
-            // 计算分母 val = a^H * y (由于 Pn 是厄米特矩阵，结果必定为实数)
             float val_r = 0.0f;
             for (int i = 0; i < NUM_MICS; i++) {
-                // a^H * y 的实部: a_r * y_r + (-a_i) * (-y_i) -> 错，应该是 a_r * y_r + a_i * y_i
                 val_r += (a_r[i] * y_r[i] + a_i[i] * y_i[i]);
             }
             
-            // 累加宽带空间谱
             int theta_idx = theta + 180;
             P_MUSIC[theta_idx] += 1.0f / (val_r + 1e-12f);
         }
     }
 
-    // 3. 在空间谱中寻找峰值
+    // 3. 寻找全频带叠加后的伪谱峰值
     float max_P = 0;
     float best_ang = 0;
     for (int i = 0; i < 360; i++) {

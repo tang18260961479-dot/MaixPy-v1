@@ -122,7 +122,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 }
 
 // ============================================================================
-// 算法 3：Baseline - Broadband MUSIC (修复协方差矩阵共轭反转)
+// 算法 3：Baseline - Broadband MUSIC (修复底层 FFT 共轭反向问题)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
@@ -138,7 +138,6 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 麦克风物理坐标系
     float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
     for (int i = 0; i < 6; i++) {
         mic_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
@@ -149,32 +148,31 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float df = SAMPLE_RATE / FFT_N;
     int start_bin = (int)ceilf(50.0f / df);
     int end_bin = (int)floorf(8000.0f / df);
+    int bin_step = 4; // 抽样步长，为了防止单片机被算力撑爆看门狗超时
 
     static float P_MUSIC[360] = {0};
     for (int i = 0; i < 360; i++) P_MUSIC[i] = 0.0f;
 
     // 2. 遍历每一个有效频点，执行 MUSIC 空间谱累加
-    for (int bin = start_bin; bin <= end_bin; bin++) {
+    for (int bin = start_bin; bin <= end_bin; bin += bin_step) {
         float freq = bin * df;
         float omega = 2.0f * PI * freq;
 
         // --- A. 建立 7x7 复数协方差矩阵 Rxx = X * X^H ---
         float Rxx_r[NUM_MICS][NUM_MICS] = {0};
         float Rxx_i[NUM_MICS][NUM_MICS] = {0};
+        float norm_X_sq = 0.0f;
+        
         for (int i = 0; i < NUM_MICS; i++) {
+            norm_X_sq += (mic_real[i][bin] * mic_real[i][bin] + mic_imag[i][bin] * mic_imag[i][bin]);
             for (int j = 0; j < NUM_MICS; j++) {
-                // 实部保持不变
                 Rxx_r[i][j] = mic_real[i][bin] * mic_real[j][bin] + mic_imag[i][bin] * mic_imag[j][bin];
-                
-                // -----------------------------------------------------------------
-                // 【核心修复】：由于 FFT 虚部自带负号，真实的 Rxx 虚部计算公式中，
-                // mic_real 和 mic_imag 的位置必须如下排列，才能与 MATLAB 完全对齐！
-                // -----------------------------------------------------------------
-                Rxx_i[i][j] = mic_real[i][bin] * mic_imag[j][bin] - mic_imag[i][bin] * mic_real[j][bin];
+                Rxx_i[i][j] = mic_imag[i][bin] * mic_real[j][bin] - mic_real[i][bin] * mic_imag[j][bin];
             }
         }
+        if (norm_X_sq < 1e-9f) continue;
 
-        // --- B. 幂迭代法求解主特征向量 (Signal Subspace) ---
+        // --- B. 幂迭代法求解主特征向量 (Signal Subspace V) ---
         float V_r[NUM_MICS] = {1, 1, 1, 1, 1, 1, 1}; 
         float V_i[NUM_MICS] = {0, 0, 0, 0, 0, 0, 0};
         
@@ -225,9 +223,15 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             for (int m = 0; m < NUM_MICS; m++) {
                 float phase = omega * (mic_pos_x[m] * cos_t + mic_pos_y[m] * sin_t) / SOUND_SPEED;
                 a_r[m] = cosf(phase);
-                a_i[m] = sinf(phase); 
+                
+                // -------------------------------------------------------------
+                // 【核心修复】：导向矢量必须在此处添加负号，提取共轭！
+                // 抵消由底层正向 FFT 所带来的复数域镜像问题，与 MATLAB 对齐。
+                // -------------------------------------------------------------
+                a_i[m] = -sinf(phase); 
             }
             
+            // 计算 y = Pn * a
             float y_r[NUM_MICS] = {0}, y_i[NUM_MICS] = {0};
             for (int i = 0; i < NUM_MICS; i++) {
                 for (int j = 0; j < NUM_MICS; j++) {
@@ -236,6 +240,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
                 }
             }
             
+            // 计算分母 val = a^H * y
             float val_r = 0.0f;
             for (int i = 0; i < NUM_MICS; i++) {
                 val_r += (a_r[i] * y_r[i] + a_i[i] * y_i[i]);
@@ -246,7 +251,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    // 3. 寻找全频带叠加后的伪谱峰值
+    // 3. 寻找全频段叠加的最强空间谱峰
     float max_P = 0;
     float best_ang = 0;
     for (int i = 0; i < 360; i++) {
@@ -260,6 +265,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     if (final_ang < 0) final_ang += 360.0f;
     return final_ang - 180.0f;
 }
+
 // ============================================================================
 // 第三部分：MicroPython 底层接口绑定 (与系统保持一致)
 // ============================================================================

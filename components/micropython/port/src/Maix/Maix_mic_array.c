@@ -28,7 +28,7 @@
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：M-估计 DOA 算法的核心宏定义、结构体与全局变量
+// 第一部分：核心宏定义、结构体与全局变量 (控制变量：严格保持一致)
 // ============================================================================
 
 #define FFT_N 1024
@@ -123,28 +123,14 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     }
 }
 
-// 3. 辅助数学函数: 中位数
-static float calculate_median(float* array, int size) {
-    float temp[NUM_PAIRS];
-    for(int i = 0; i < size; i++) temp[i] = array[i];
-    for (int i = 0; i < size - 1; i++) {
-        for (int j = 0; j < size - i - 1; j++) {
-            if (temp[j] > temp[j + 1]) {
-                float swap = temp[j]; 
-                temp[j] = temp[j + 1]; 
-                temp[j + 1] = swap;
-            }
-        }
-    }
-    return temp[size / 2];
-}
-
-// 4. M-估计核心测向流水线
+// ============================================================================
+// 算法 1：Baseline - TDOA Grid Search (网格搜索法核心)
+// ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; // 静态分配防止栈溢出
     static float mic_imag[NUM_MICS][FFT_N]; // 静态分配防止栈溢出
     
-    // 加窗与正向 FFT
+    // 1. 加窗与正向 FFT
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
             float window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -158,7 +144,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float Qual_Score[NUM_PAIRS] = {0};
     static float R_real[FFT_N], R_imag[FFT_N];
 
-    // GCC-PHAT 计算
+    // 2. GCC-PHAT 计算到达时间差 (与本文算法绝对一致的前提)
     int k = 0;
     for (int u = 0; u < NUM_MICS; u++) {
         for (int v = u + 1; v < NUM_MICS; v++) {
@@ -171,8 +157,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
 
-            float max_val = 0; 
-            int max_idx = 0;
+            float max_val = 0; int max_idx = 0;
             int search_range = 8; 
             for (int i = 0; i <= search_range; i++) {
                 if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
@@ -197,9 +182,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    // 粗网格搜索
+    // 3. 核心差异：全空间粗网格搜索 (Grid Search) 替代 GN 微调
     float min_cost = FLT_MAX;
-    float ang_coarse = 0.0f;
+    float best_ang = 0.0f;
     for (int theta = -180; theta < 180; theta++) {
         float cost = 0.0f;
         float cos_t = cosf(theta * DEG2RAD);
@@ -210,58 +195,17 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             float err = theo_tdoa - Meas_TDOA[p];
             cost += Qual_Score[p] * pair_conf[p].dist * err * err;
         }
-        if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
+        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
-    // 自适应权重
-    float raw_residuals_t[NUM_PAIRS];
-    float cos_coarse = cosf(ang_coarse * DEG2RAD);
-    float sin_coarse = sinf(ang_coarse * DEG2RAD);
-    for (int p = 0; p < NUM_PAIRS; p++) {
-        float theo_tdoa = (pair_conf[p].dx * cos_coarse + pair_conf[p].dy * sin_coarse) / SOUND_SPEED;
-        raw_residuals_t[p] = fabsf(Meas_TDOA[p] - theo_tdoa);
-    }
-    float med_res_m = calculate_median(raw_residuals_t, NUM_PAIRS) * SOUND_SPEED;
-    float sigma_adaptive_m = med_res_m * 1.5f;
-    if (sigma_adaptive_m < 0.015f) sigma_adaptive_m = 0.015f;
-    if (sigma_adaptive_m > 0.10f) sigma_adaptive_m = 0.10f;
-    float sigma_adaptive_t = sigma_adaptive_m / SOUND_SPEED;
-
-    float Final_W[NUM_PAIRS];
-    for (int p = 0; p < NUM_PAIRS; p++) {
-        float res_sq = raw_residuals_t[p] * raw_residuals_t[p];
-        float w_consist = expf(-res_sq / (2.0f * sigma_adaptive_t * sigma_adaptive_t));
-        Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
-    }
-
-    // Gauss-Newton 微调
-    float ang_gn = ang_coarse;
-    for (int iter = 0; iter < 8; iter++) {
-        float sum_WJr = 0.0f, sum_WJJ = 0.0f;
-        int valid_count = 0;
-        float cos_gn = cosf(ang_gn * DEG2RAD), sin_gn = sinf(ang_gn * DEG2RAD);
-        for (int p = 0; p < NUM_PAIRS; p++) {
-            if (Final_W[p] < 1e-4f) continue;
-            valid_count++;
-            float theo_tdoa = (pair_conf[p].dx * cos_gn + pair_conf[p].dy * sin_gn) / SOUND_SPEED;
-            float r_p = theo_tdoa - Meas_TDOA[p];
-            float J_p = DEG2RAD * (-pair_conf[p].dx * sin_gn + pair_conf[p].dy * cos_gn) / SOUND_SPEED;
-            sum_WJr += Final_W[p] * J_p * r_p;
-            sum_WJJ += Final_W[p] * J_p * J_p;
-        }
-        if (valid_count < 3) break;
-        float delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
-        ang_gn += delta_ang;
-        if (fabsf(delta_ang) < 1e-3f) break;
-    }
-    
-    ang_gn = fmodf(ang_gn + 180.0f, 360.0f);
-    if (ang_gn < 0) ang_gn += 360.0f;
-    return ang_gn - 180.0f;
+    // Baseline 直接输出网格搜索的最优解
+    float final_ang = fmodf(best_ang + 180.0f, 360.0f);
+    if (final_ang < 0) final_ang += 360.0f;
+    return final_ang - 180.0f;
 }
 
 // ============================================================================
-// 第三部分：MicroPython 底层接口绑定
+// 第三部分：MicroPython 底层接口绑定 (与 M-估计版本完全一致)
 // ============================================================================
 
 // DMA 接收中断回调
@@ -301,12 +245,9 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     sipeed_init_mic_array_led();
 
-    // ==========================================================
     // 核心修复点：给 I2S 硬件上电并提供时钟信号
-    // ==========================================================
     sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ); 
     sysctl_clock_enable(SYSCTL_CLOCK_I2S0);
-    // ==========================================================
 
     // 纯硬件级 I2S 初始化
     i2s_init(I2S_DEVICE_0, I2S_RECEIVER, 0x0F);
@@ -319,10 +260,8 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 
     init_array_geometry();
 
-    // 先独立注册 DMA 中断回调函数 (优先级设为 3)
+    // 注册 DMA 中断并开启传输
     dmac_set_irq(DMAC_CHANNEL4, i2s_dma_cb, NULL, 3);
-    
-    // 再开启非阻塞 DMA 录音 (只传 4 个参数)
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
     
     return mp_const_true;
@@ -367,10 +306,10 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
         mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
     }
 
-    // 立即重启 DMA (只传 4 个参数)
+    // 重启 DMA
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 运行硬核管线
+    // 运行 Baseline 1 管线
     float final_angle = run_doa_pipeline(mic_raw_float);
 
     return mp_obj_new_float(final_angle);

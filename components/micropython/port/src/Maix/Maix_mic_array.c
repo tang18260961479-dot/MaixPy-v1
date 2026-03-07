@@ -367,15 +367,88 @@ STATIC mp_obj_t Maix_mic_array_get_record_audio(void) {
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_record_audio_obj, Maix_mic_array_get_record_audio);
 
+// ----------------------------------------------------------------------------
+// 全新 API：锁角波束成形录音 (Delay-and-Sum Beamforming)
+// 传入目标角度，自动对 7 个麦克风进行相位对齐与叠加，耗时 < 2ms
+// ----------------------------------------------------------------------------
+STATIC mp_obj_t Maix_mic_array_get_beam_audio(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    // 获取 Python 传进来的目标角度
+    float target_angle = mp_obj_get_float(pos_args[0]);
+
+    volatile uint8_t retry = 100;
+    while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
+    if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
+    rx_flag = 0;
+
+    // 提取 7 个通道的纯净数据
+    float mic_raw[NUM_MICS][FFT_N];
+    for (int i = 0; i < FFT_N; i++) {
+        mic_raw[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
+        mic_raw[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
+        mic_raw[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
+        mic_raw[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
+        mic_raw[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
+        mic_raw[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
+        mic_raw[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); // 中心麦克风
+    }
+
+    // 重启 DMA，不耽误下一帧
+    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
+
+    // 计算各阵元相对于中心麦克风的理论延迟样本数
+    float cos_t = cosf(target_angle * DEG2RAD);
+    float sin_t = sinf(target_angle * DEG2RAD);
+    int shift_samples[NUM_MICS];
+    for (int m = 0; m < NUM_MICS; m++) {
+        float mx = (m < 6) ? (0.04f * cosf(m * 60.0f * DEG2RAD)) : 0.0f;
+        float my = (m < 6) ? (0.04f * sinf(m * 60.0f * DEG2RAD)) : 0.0f;
+        float tau = (mx * cos_t + my * sin_t) / SOUND_SPEED;
+        shift_samples[m] = (int)roundf(tau * SAMPLE_RATE);
+    }
+
+    static float prev_x = 0.0f;
+    static float prev_y = 0.0f;
+    int16_t pcm_out[FFT_N];
+
+    // 执行延时求和 (Delay-and-Sum)
+    for (int i = 0; i < FFT_N; i++) {
+        float sum = 0.0f;
+        for (int m = 0; m < NUM_MICS; m++) {
+            int target_idx = i - shift_samples[m];
+            // 防止数组越界
+            if (target_idx >= 0 && target_idx < FFT_N) {
+                sum += mic_raw[m][target_idx];
+            }
+        }
+        sum /= NUM_MICS; // 叠加平均，此时目标方向声音极大增强，噪声被削弱
+
+        // 加入 IIR 高通滤波 (去直流)，保障音质
+        float y = sum - prev_x + 0.995f * prev_y;
+        prev_x = sum;
+        prev_y = y;
+
+        // 放大增强后的波束成形音频
+        float amplified = y * 5.0f; 
+        if(amplified > 32767.0f) amplified = 32767.0f;
+        if(amplified < -32768.0f) amplified = -32768.0f;
+
+        pcm_out[i] = (int16_t)amplified;
+    }
+
+    return mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
+}
+MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_get_beam_audio_obj, 1, Maix_mic_array_get_beam_audio);
+
 // 注册字典 (新增了 get_audio_dir 接口)
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_audio_dir), MP_ROM_PTR(&Maix_mic_array_get_audio_dir_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_record_audio), MP_ROM_PTR(&Maix_mic_array_get_record_audio_obj) }, // <--- 加入这一行
+    { MP_ROM_QSTR(MP_QSTR_get_record_audio), MP_ROM_PTR(&Maix_mic_array_get_record_audio_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_map), MP_ROM_PTR(&Maix_mic_array_get_map_obj) },
+{ MP_ROM_QSTR(MP_QSTR_get_beam_audio), MP_ROM_PTR(&Maix_mic_array_get_beam_audio_obj) },
 };
 STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
 

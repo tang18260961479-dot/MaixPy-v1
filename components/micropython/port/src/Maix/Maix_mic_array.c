@@ -327,8 +327,7 @@ STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, 
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);
 
 // ----------------------------------------------------------------------------
-// 全新 API：极速纯录音通道 (绕过所有 DOA 算法，耗时 < 1ms)
-// 专门用于长时间、不丢帧地记录中心麦克风的原始数据
+// 全新 API：极速纯录音通道 (加入 IIR 去直流高通滤波器，解决爆音与底噪)
 // ----------------------------------------------------------------------------
 STATIC mp_obj_t Maix_mic_array_get_record_audio(void) {
     volatile uint8_t retry = 100;
@@ -336,25 +335,34 @@ STATIC mp_obj_t Maix_mic_array_get_record_audio(void) {
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
+    // 静态变量：用于保存滤波器的上一状态
+    static float prev_x = 0.0f;
+    static float prev_y = 0.0f;
+    
     int16_t pcm_out[FFT_N];
     for (int i = 0; i < FFT_N; i++) {
-        // 直接提取第 7 个通道（中心麦克风），右移 16 位得到 16-bit 裸流
-        int32_t raw = i2s_rx_buf[i*8 + 6] >> 16;
+        // 1. 获取原始数据
+        float x = (float)(i2s_rx_buf[i*8 + 6] >> 16);
         
-        // 增加一点数字增益，让人声更清晰 (比如乘个 2.0)
-        float amplified = (float)raw * 2.0f;
+        // 2. 核心数学：IIR 一阶高通滤波器 (彻底消除 DC 直流偏置)
+        // 截止频率极低，不影响人声，只会把基准线强行拉回 0
+        float y = x - prev_x + 0.995f * prev_y;
+        prev_x = x;
+        prev_y = y;
         
-        // 限幅保护，防止溢出产生爆音
+        // 3. 增强纯净人声 (因为基准线归 0，现在可以放心大胆地放大 4.0 倍甚至更高)
+        float amplified = y * 4.0f; 
+        
+        // 4. 限幅保护
         if(amplified > 32767.0f) amplified = 32767.0f;
         if(amplified < -32768.0f) amplified = -32768.0f;
         
         pcm_out[i] = (int16_t)amplified;
     }
 
-    // 立即重启 DMA 接收下一帧，绝不耽误
+    // 立即重启 DMA
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 直接以 bytes 形式返回给 Python
     return mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_record_audio_obj, Maix_mic_array_get_record_audio);

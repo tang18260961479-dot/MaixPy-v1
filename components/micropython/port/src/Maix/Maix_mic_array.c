@@ -326,12 +326,46 @@ STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, 
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);
 
+// ----------------------------------------------------------------------------
+// 全新 API：极速纯录音通道 (绕过所有 DOA 算法，耗时 < 1ms)
+// 专门用于长时间、不丢帧地记录中心麦克风的原始数据
+// ----------------------------------------------------------------------------
+STATIC mp_obj_t Maix_mic_array_get_record_audio(void) {
+    volatile uint8_t retry = 100;
+    while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
+    if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
+    rx_flag = 0;
+
+    int16_t pcm_out[FFT_N];
+    for (int i = 0; i < FFT_N; i++) {
+        // 直接提取第 7 个通道（中心麦克风），右移 16 位得到 16-bit 裸流
+        int32_t raw = i2s_rx_buf[i*8 + 6] >> 16;
+        
+        // 增加一点数字增益，让人声更清晰 (比如乘个 2.0)
+        float amplified = (float)raw * 2.0f;
+        
+        // 限幅保护，防止溢出产生爆音
+        if(amplified > 32767.0f) amplified = 32767.0f;
+        if(amplified < -32768.0f) amplified = -32768.0f;
+        
+        pcm_out[i] = (int16_t)amplified;
+    }
+
+    // 立即重启 DMA 接收下一帧，绝不耽误
+    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
+
+    // 直接以 bytes 形式返回给 Python
+    return mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
+}
+MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_record_audio_obj, Maix_mic_array_get_record_audio);
+
 // 注册字典 (新增了 get_audio_dir 接口)
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_audio_dir), MP_ROM_PTR(&Maix_mic_array_get_audio_dir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_record_audio), MP_ROM_PTR(&Maix_mic_array_get_record_audio_obj) }, // <--- 加入这一行
     { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_map), MP_ROM_PTR(&Maix_mic_array_get_map_obj) },
 };

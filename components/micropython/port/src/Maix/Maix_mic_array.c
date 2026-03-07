@@ -2,7 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
-#include "py/mpthread.h"  // 引入多线程 GIL 控制库
+
 #include "py/obj.h"
 #include "py/runtime.h"
 #include "py/mphal.h"
@@ -13,6 +13,7 @@
 #include "mphalport.h"
 #include "modMaix.h"
 #include "imlib.h"
+#include "py/mpthread.h"  // 引入多线程 GIL 控制库
 
 #include "sleep.h"
 #include "lcd.h"
@@ -30,8 +31,8 @@
 // 第一部分：全局变量与双核异步共享内存
 // ============================================================================
 #define FFT_N 1024
-#define DOA_MICS 6       // 剔除有物理冲突的中心麦克风，仅用外围 6 颗测向
-#define DOA_PAIRS 15     // 6个麦克风只产生 15 个组合 (省下大量算力)
+#define DOA_MICS 6       
+#define DOA_PAIRS 15     
 #define SAMPLE_RATE 48000.0f
 #define SOUND_SPEED 343.0f
 #undef PI
@@ -45,9 +46,9 @@ STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 
 // 双核通信桥梁
-static volatile float current_target_angle = 0.0f;     // 雷达兵更新，录音兵读取
-static float shared_doa_mic_data[DOA_MICS][FFT_N];     // 录音兵投递的快照
-static volatile int shared_data_ready = 0;             // 投递状态锁
+static volatile float current_target_angle = 0.0f;     
+static float shared_doa_mic_data[DOA_MICS][FFT_N];     
+static volatile int shared_data_ready = 0;             
 
 // ============================================================================
 // 第二部分：纯 C 语言硬核数学与信号处理管线 (6 阵元提速版)
@@ -227,7 +228,7 @@ STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
 // ============================================================================
-// 【录音兵接口】：瞬间拿数据、存快照、自动波束成形 (不再需要传入角度参数)
+// 【录音兵接口】：瞬间拿数据、存快照、自动波束成形 (已修复栈溢出)
 // ============================================================================
 STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     volatile uint8_t retry = 100;
@@ -235,7 +236,8 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    float mic_raw[DOA_MICS][FFT_N];
+    // 【核心修复】：使用 static 关键字，将 24KB 数组移出栈空间！
+    static float mic_raw[DOA_MICS][FFT_N];
     for (int i = 0; i < FFT_N; i++) {
         mic_raw[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
         mic_raw[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
@@ -245,7 +247,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
         mic_raw[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
     }
 
-    // [核心异步逻辑]：如果雷达兵空闲，就把这帧数据的拷贝塞给他
     if (shared_data_ready == 0) {
         for(int m=0; m<DOA_MICS; m++) {
             for(int i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_raw[m][i];
@@ -253,15 +254,14 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
         shared_data_ready = 1; 
     }
 
-    // 立即重启 DMA
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 读取全局变量中的实时追踪角度
     float target_angle = current_target_angle;
-
     float cos_t = cosf(target_angle * DEG2RAD);
     float sin_t = sinf(target_angle * DEG2RAD);
-    int shift_samples[DOA_MICS];
+    
+    // 【核心修复】：移出栈空间
+    static int shift_samples[DOA_MICS];
     for (int m = 0; m < DOA_MICS; m++) {
         float mx = 0.04f * cosf(m * 60.0f * DEG2RAD);
         float my = 0.04f * sinf(m * 60.0f * DEG2RAD);
@@ -271,7 +271,9 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 
     static float prev_x = 0.0f;
     static float prev_y = 0.0f;
-    int16_t pcm_out[FFT_N];
+    
+    // 【核心修复】：移出栈空间
+    static int16_t pcm_out[FFT_N];
 
     for (int i = 0; i < FFT_N; i++) {
         float sum = 0.0f;
@@ -290,7 +292,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
         pcm_out[i] = (int16_t)amplified;
     }
 
-    // 返回：1. 最新角度, 2. 追踪音频
     mp_obj_t tuple[2];
     tuple[0] = mp_obj_new_float(target_angle);
     tuple[1] = mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
@@ -299,34 +300,27 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
 
 // ============================================================================
-// 【雷达兵接口】：加入 GIL 释放机制，绝不阻塞录音主线程！
+// 【雷达兵接口】：加入 GIL 释放机制与栈溢出修复！
 // ============================================================================
 STATIC mp_obj_t Maix_mic_array_track_doa(void) {
     if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
 
-    // 迅速把数据拷贝到本地，然后开锁 (允许录音兵在下一次帧满时写入)
-    float local_mic_data[DOA_MICS][FFT_N];
+    // 【核心修复】：使用 static 关键字，将 24KB 数组移出新线程的栈空间！
+    static float local_mic_data[DOA_MICS][FFT_N];
     for(int m=0; m<DOA_MICS; m++) {
         for(int i=0; i<FFT_N; i++) local_mic_data[m][i] = shared_doa_mic_data[m][i];
     }
     shared_data_ready = 0; 
 
-    // ====================================================
-    // 【核心修复】：释放 Python 解释器锁 (GIL)
-    // 此时 Core 1 纯靠 C 语言算矩阵，把 Python 运行权还给 Core 0 去录音！
-    // ====================================================
+    // 释放 Python 全局锁，让核心 1 纯靠 C 语言算矩阵，主线程可继续录音！
     MP_THREAD_GIL_EXIT(); 
     
-    // 慢慢跑 DOA (约耗时 55ms，此期间录音主线程畅通无阻)
     float new_angle = run_doa_pipeline(local_mic_data);
     
-    // 重新获取 Python 锁，准备返回数据
+    // 算完后重新获取 Python 锁
     MP_THREAD_GIL_ENTER();
-    // ====================================================
     
-    // 更新全局变量，瞬间改变录音兵的波束方向
     current_target_angle = new_angle;
-    
     return mp_obj_new_float(new_angle);
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_track_doa_obj, Maix_mic_array_track_doa);

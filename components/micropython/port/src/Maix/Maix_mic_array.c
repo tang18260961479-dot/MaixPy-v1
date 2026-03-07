@@ -15,7 +15,6 @@
 
 #define PLL2_OUTPUT_FREQ 45158400UL
 #define FFT_N 1024
-#define NUM_MICS 6       // 只提取 6 颗外围纯净麦克风
 #define SAMPLE_RATE 48000
 
 STATIC volatile uint8_t rx_flag = 0;
@@ -62,51 +61,47 @@ STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
 // ============================================================================
-// 极速获取 6 通道交织 PCM 音频 (专为 MATLAB 离线分析打造)
+// 极速获取单通道 (第 0 号外围纯净麦克风) 音频数据
 // ============================================================================
-STATIC mp_obj_t Maix_mic_array_get_raw_6ch(void) {
+STATIC mp_obj_t Maix_mic_array_get_raw_1ch(void) {
     volatile uint8_t retry = 100;
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    static float prev_x[NUM_MICS] = {0};
-    static float prev_y[NUM_MICS] = {0};
-    
-    // 生成 6 通道交织数据：[m0, m1, m2, m3, m4, m5, m0, m1...]
-    static int16_t pcm_out[FFT_N * NUM_MICS];
+    static float prev_x = 0.0f;
+    static float prev_y = 0.0f;
+    static int16_t pcm_out[FFT_N];
 
     for (int i = 0; i < FFT_N; i++) {
-        for (int m = 0; m < NUM_MICS; m++) {
-            // 提取高 16 位有效数据
-            float x = (float)(i2s_rx_buf[i*8 + m] >> 16);
-            
-            // 独立的 IIR 滤波器消除各通道直流偏置
-            float y = x - prev_x[m] + 0.995f * prev_y[m];
-            prev_x[m] = x;
-            prev_y[m] = y;
+        // [核心逻辑]: 仅提取第 0 号麦克风 (避开 6 号中心引脚冲突)
+        float x = (float)(i2s_rx_buf[i*8 + 0] >> 16);
+        
+        // IIR 滤波器消除直流偏置
+        float y = x - prev_x + 0.995f * prev_y;
+        prev_x = x;
+        prev_y = y;
 
-            float amplified = y * 4.0f; // 数字增益
-            if(amplified > 32767.0f) amplified = 32767.0f;
-            if(amplified < -32768.0f) amplified = -32768.0f;
-            
-            // 写入交织数组
-            pcm_out[i * NUM_MICS + m] = (int16_t)amplified;
-        }
+        // 适当放大增益以匹配之前束波成型的音量
+        float amplified = y * 4.0f; 
+        if(amplified > 32767.0f) amplified = 32767.0f;
+        if(amplified < -32768.0f) amplified = -32768.0f;
+        
+        pcm_out[i] = (int16_t)amplified;
     }
 
     // 立即重启 DMA
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 返回一整块 12KB 的字节流给 Python
-    return mp_obj_new_bytes((const byte*)pcm_out, FFT_N * NUM_MICS * sizeof(int16_t));
+    // 每帧返回 2KB 字节流给 Python
+    return mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
 }
-MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_raw_6ch_obj, Maix_mic_array_get_raw_6ch);
+MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_raw_1ch_obj, Maix_mic_array_get_raw_1ch);
 
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_raw_6ch), MP_ROM_PTR(&Maix_mic_array_get_raw_6ch_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_raw_1ch), MP_ROM_PTR(&Maix_mic_array_get_raw_1ch_obj) },
 };
 STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
 

@@ -2,7 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
-
+#include "py/mpthread.h"  // 引入多线程 GIL 控制库
 #include "py/obj.h"
 #include "py/runtime.h"
 #include "py/mphal.h"
@@ -299,10 +299,9 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
 
 // ============================================================================
-// 【雷达兵接口】：在另一个线程被疯狂调用，提取快照，计算角度，更新全局目标
+// 【雷达兵接口】：加入 GIL 释放机制，绝不阻塞录音主线程！
 // ============================================================================
 STATIC mp_obj_t Maix_mic_array_track_doa(void) {
-    // 如果录音兵还没塞入新数据，直接返回旧角度
     if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
 
     // 迅速把数据拷贝到本地，然后开锁 (允许录音兵在下一次帧满时写入)
@@ -312,8 +311,18 @@ STATIC mp_obj_t Maix_mic_array_track_doa(void) {
     }
     shared_data_ready = 0; 
 
-    // 慢慢跑 DOA (约耗时 55ms，此期间 DMA 和录音兵均不受阻碍)
+    // ====================================================
+    // 【核心修复】：释放 Python 解释器锁 (GIL)
+    // 此时 Core 1 纯靠 C 语言算矩阵，把 Python 运行权还给 Core 0 去录音！
+    // ====================================================
+    MP_THREAD_GIL_EXIT(); 
+    
+    // 慢慢跑 DOA (约耗时 55ms，此期间录音主线程畅通无阻)
     float new_angle = run_doa_pipeline(local_mic_data);
+    
+    // 重新获取 Python 锁，准备返回数据
+    MP_THREAD_GIL_ENTER();
+    // ====================================================
     
     // 更新全局变量，瞬间改变录音兵的波束方向
     current_target_angle = new_angle;

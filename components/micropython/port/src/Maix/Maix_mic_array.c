@@ -27,11 +27,11 @@
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：全局变量与双核异步共享内存 (完美恢复 7 阵元与 21 对基线)
+// 第一部分：全局变量与双核异步共享内存 (7 阵元与 21 对基线)
 // ============================================================================
 #define FFT_N 1024
-#define NUM_MICS 7       // 恢复 7 颗麦克风
-#define NUM_PAIRS 21     // 恢复 21 对互相关
+#define NUM_MICS 7       // 7 颗麦克风
+#define NUM_PAIRS 21     // 21 对互相关
 #define SAMPLE_RATE 48000.0f
 #define SOUND_SPEED 343.0f
 #undef PI
@@ -44,13 +44,13 @@ MicPairConf pair_conf[NUM_PAIRS];
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 
-// 双核通信桥梁
+// 双核通信桥梁 (严禁修改)
 static volatile float current_target_angle = 0.0f;     
 static float shared_doa_mic_data[NUM_MICS][FFT_N];     
 static volatile int shared_data_ready = 0;             
 
 // ============================================================================
-// 第二部分：纯正的 M-估计 数学管线 (原封不动对标 MATLAB)
+// 第二部分：纯正的 GCC-PHAT + 网格搜索 数学管线
 // ============================================================================
 static void init_array_geometry(void) {
     float R = 0.04f;
@@ -60,7 +60,7 @@ static void init_array_geometry(void) {
         mic_pos_2d[i][0] = R * cosf(theta_mic[i] * DEG2RAD);
         mic_pos_2d[i][1] = R * sinf(theta_mic[i] * DEG2RAD);
     }
-    // 恢复中心麦克风的物理坐标 (0,0)
+    // 中心麦克风
     mic_pos_2d[6][0] = 0.0f; 
     mic_pos_2d[6][1] = 0.0f;
 
@@ -101,32 +101,26 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
-static float calculate_median(float* array, int size) {
-    float temp[NUM_PAIRS];
-    for(int i = 0; i < size; i++) temp[i] = array[i];
-    for (int i = 0; i < size - 1; i++) {
-        for (int j = 0; j < size - i - 1; j++) {
-            if (temp[j] > temp[j + 1]) {
-                float swap = temp[j]; temp[j] = temp[j + 1]; temp[j + 1] = swap;
-            }
-        }
-    }
-    return temp[size / 2];
-}
-
+// 【数学内核替换区】：GCC-PHAT + 粗网格全局搜索
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N]; static float mic_imag[NUM_MICS][FFT_N]; 
+    static float mic_real[NUM_MICS][FFT_N]; 
+    static float mic_imag[NUM_MICS][FFT_N]; 
+    
+    // 1. 加窗与正向 FFT
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
             float window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
-            mic_real[m][i] = mic_data[m][i] * window; mic_imag[m][i] = 0.0f;
+            mic_real[m][i] = mic_data[m][i] * window;
+            mic_imag[m][i] = 0.0f;
         }
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    float Meas_TDOA[NUM_PAIRS] = {0}; float Qual_Score[NUM_PAIRS] = {0};
+    float Meas_TDOA[NUM_PAIRS] = {0};
+    float Qual_Score[NUM_PAIRS] = {0};
     static float R_real[FFT_N], R_imag[FFT_N];
 
+    // 2. GCC-PHAT 计算到达时间差
     int k = 0;
     for (int u = 0; u < NUM_MICS; u++) {
         for (int v = u + 1; v < NUM_MICS; v++) {
@@ -134,18 +128,29 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
                 float cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
                 float cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
+                R_real[i] = cross_r / mag;
+                R_imag[i] = cross_i / mag;
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
-            float max_val = 0; int max_idx = 0; int search_range = 8; 
-            for (int i = 0; i <= search_range; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
-            for (int i = FFT_N - search_range; i < FFT_N; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
+
+            float max_val = 0; int max_idx = 0;
+            int search_range = 8; 
+            for (int i = 0; i <= search_range; i++) {
+                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
+            }
+            for (int i = FFT_N - search_range; i < FFT_N; i++) {
+                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
+            }
+
             float delta = 0;
             if (max_idx > 0 && max_idx < FFT_N - 1) {
-                float y1 = R_real[max_idx - 1]; float y2 = R_real[max_idx]; float y3 = R_real[max_idx + 1];
+                float y1 = R_real[max_idx - 1];
+                float y2 = R_real[max_idx];
+                float y3 = R_real[max_idx + 1];
                 float denom = 2.0f * (y1 - 2.0f * y2 + y3);
                 if (fabsf(denom) > 1e-9f) delta = (y1 - y3) / denom;
             }
+            
             float tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
             Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
             Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
@@ -153,60 +158,29 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    float min_cost = FLT_MAX; float ang_coarse = 0.0f;
+    // 3. 核心差异：全空间粗网格搜索 (Grid Search)
+    float min_cost = FLT_MAX;
+    float best_ang = 0.0f;
     for (int theta = -180; theta < 180; theta++) {
-        float cost = 0.0f; float cos_t = cosf(theta * DEG2RAD); float sin_t = sinf(theta * DEG2RAD);
+        float cost = 0.0f;
+        float cos_t = cosf(theta * DEG2RAD);
+        float sin_t = sinf(theta * DEG2RAD);
         for (int p = 0; p < NUM_PAIRS; p++) {
             if (Qual_Score[p] < 1e-3f) continue;
             float theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
             float err = theo_tdoa - Meas_TDOA[p];
             cost += Qual_Score[p] * pair_conf[p].dist * err * err;
         }
-        if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
+        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
-    float raw_residuals_t[NUM_PAIRS]; float cos_coarse = cosf(ang_coarse * DEG2RAD); float sin_coarse = sinf(ang_coarse * DEG2RAD);
-    for (int p = 0; p < NUM_PAIRS; p++) {
-        float theo_tdoa = (pair_conf[p].dx * cos_coarse + pair_conf[p].dy * sin_coarse) / SOUND_SPEED;
-        raw_residuals_t[p] = fabsf(Meas_TDOA[p] - theo_tdoa);
-    }
-    float med_res_m = calculate_median(raw_residuals_t, NUM_PAIRS) * SOUND_SPEED;
-    float sigma_adaptive_m = med_res_m * 1.5f;
-    if (sigma_adaptive_m < 0.015f) sigma_adaptive_m = 0.015f;
-    if (sigma_adaptive_m > 0.10f) sigma_adaptive_m = 0.10f;
-    float sigma_adaptive_t = sigma_adaptive_m / SOUND_SPEED;
-
-    float Final_W[NUM_PAIRS];
-    for (int p = 0; p < NUM_PAIRS; p++) {
-        float res_sq = raw_residuals_t[p] * raw_residuals_t[p];
-        float w_consist = expf(-res_sq / (2.0f * sigma_adaptive_t * sigma_adaptive_t));
-        Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
-    }
-
-    float ang_gn = ang_coarse;
-    for (int iter = 0; iter < 8; iter++) {
-        float sum_WJr = 0.0f, sum_WJJ = 0.0f; int valid_count = 0;
-        float cos_gn = cosf(ang_gn * DEG2RAD), sin_gn = sinf(ang_gn * DEG2RAD);
-        for (int p = 0; p < NUM_PAIRS; p++) {
-            if (Final_W[p] < 1e-4f) continue;
-            valid_count++;
-            float theo_tdoa = (pair_conf[p].dx * cos_gn + pair_conf[p].dy * sin_gn) / SOUND_SPEED;
-            float r_p = theo_tdoa - Meas_TDOA[p];
-            float J_p = DEG2RAD * (-pair_conf[p].dx * sin_gn + pair_conf[p].dy * cos_gn) / SOUND_SPEED;
-            sum_WJr += Final_W[p] * J_p * r_p; sum_WJJ += Final_W[p] * J_p * J_p;
-        }
-        if (valid_count < 3) break;
-        float delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
-        ang_gn += delta_ang; if (fabsf(delta_ang) < 1e-3f) break;
-    }
-    
-    ang_gn = fmodf(ang_gn + 180.0f, 360.0f);
-    if (ang_gn < 0) ang_gn += 360.0f;
-    return ang_gn - 180.0f;
+    float final_ang = fmodf(best_ang + 180.0f, 360.0f);
+    if (final_ang < 0) final_ang += 360.0f;
+    return final_ang - 180.0f;
 }
 
 // ============================================================================
-// 第三部分：核心 API 与异步并行接口
+// 第三部分：核心 API 与异步并行接口 (外壳严格不变)
 // ============================================================================
 static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
 
@@ -230,9 +204,7 @@ MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
 STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
-// ============================================================================
-// 【录音兵接口】：提取 7 颗用于测向，但波束成型只使用前 6 颗！
-// ============================================================================
+// 录音兵接口：提取 7 颗用于测向，波束成型只使用前 6 颗！
 STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     volatile uint8_t retry = 100;
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
@@ -247,7 +219,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
         mic_raw[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
         mic_raw[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
         mic_raw[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
-        mic_raw[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); // 取出中心麦用于传递给雷达
+        mic_raw[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); 
     }
 
     if (shared_data_ready == 0) {
@@ -263,7 +235,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     float cos_t = cosf(target_angle * DEG2RAD);
     float sin_t = sinf(target_angle * DEG2RAD);
     
-    // 仅仅计算 6 颗外围麦克风的平移量
     static int shift_samples[6];
     for (int m = 0; m < 6; m++) {
         float mx = 0.04f * cosf(m * 60.0f * DEG2RAD);
@@ -278,7 +249,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 
     for (int i = 0; i < FFT_N; i++) {
         float sum = 0.0f;
-        // 【关键】：这里坚决不能加中心麦克风(索引6)，只用外围6颗叠加，避开电流噪音！
         for (int m = 0; m < 6; m++) {
             int target_idx = i - shift_samples[m];
             if (target_idx >= 0 && target_idx < FFT_N) sum += mic_raw[m][target_idx];
@@ -301,9 +271,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
 
-// ============================================================================
-// 【雷达兵接口】：包含 7 阵元完整计算与 GIL 解锁机制
-// ============================================================================
+// 雷达兵接口：GIL 解锁 + 运行 GCC-PHAT 网格搜索
 STATIC mp_obj_t Maix_mic_array_track_doa(void) {
     if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
 

@@ -342,7 +342,7 @@ STATIC mp_obj_t Maix_mic_array_get_record_audio(void) {
     int16_t pcm_out[FFT_N];
     for (int i = 0; i < FFT_N; i++) {
         // 1. 获取原始数据
-        float x = (float)(i2s_rx_buf[i*8 + 6] >> 16);
+        float x = (float)(i2s_rx_buf[i*8 + 0] >> 16);
         
         // 2. 核心数学：IIR 一阶高通滤波器 (彻底消除 DC 直流偏置)
         // 截止频率极低，不影响人声，只会把基准线强行拉回 0

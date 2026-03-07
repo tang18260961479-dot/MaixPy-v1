@@ -44,13 +44,13 @@ MicPairConf pair_conf[NUM_PAIRS];
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 
-// 双核通信桥梁 (严禁修改)
+// 双核通信桥梁 (严格保持不变)
 static volatile float current_target_angle = 0.0f;     
 static float shared_doa_mic_data[NUM_MICS][FFT_N];     
 static volatile int shared_data_ready = 0;             
 
 // ============================================================================
-// 第二部分：纯正的 GCC-PHAT + 网格搜索 数学管线
+// 第二部分：纯正的 Broadband MUSIC 数学管线 (自带 7 帧滑动缓存)
 // ============================================================================
 static void init_array_geometry(void) {
     float R = 0.04f;
@@ -101,7 +101,16 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
-// 【数学内核替换区】：GCC-PHAT + 粗网格全局搜索
+// --- MUSIC 算法专属静态内存池 (移出栈空间防止内核崩溃) ---
+#define N_FRAMES 7
+#define MAX_BINS 200
+static float X_history_r[N_FRAMES][NUM_MICS][MAX_BINS];
+static float X_history_i[N_FRAMES][NUM_MICS][MAX_BINS];
+static int frame_idx = 0;
+static int frames_collected = 0;
+static float last_angle = 0.0f;
+
+// 【数学内核替换区】：宽带 MUSIC 特征分解定位算法
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
@@ -116,71 +125,155 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    float Meas_TDOA[NUM_PAIRS] = {0};
-    float Qual_Score[NUM_PAIRS] = {0};
-    static float R_real[FFT_N], R_imag[FFT_N];
+    // 麦克风物理坐标 (用于生成导向矢量 a)
+    static float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
+    static int geom_init = 0;
+    if (!geom_init) {
+        for (int i = 0; i < 6; i++) {
+            mic_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
+            mic_pos_y[i] = 0.04f * sinf(i * 60.0f * DEG2RAD);
+        }
+        mic_pos_x[6] = 0.0f; mic_pos_y[6] = 0.0f;
+        geom_init = 1;
+    }
 
-    // 2. GCC-PHAT 计算到达时间差
-    int k = 0;
-    for (int u = 0; u < NUM_MICS; u++) {
-        for (int v = u + 1; v < NUM_MICS; v++) {
-            for (int i = 0; i < FFT_N; i++) {
-                float cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
-                float cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
-                float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag;
-                R_imag[i] = cross_i / mag;
-            }
-            fft_radix2(R_real, R_imag, FFT_N, 1);
+    float df = SAMPLE_RATE / FFT_N;
+    int start_bin = (int)ceilf(50.0f / df);
+    int end_bin = (int)floorf(8000.0f / df);
+    if(end_bin >= MAX_BINS) end_bin = MAX_BINS - 1;
 
-            float max_val = 0; int max_idx = 0;
-            int search_range = 8; 
-            for (int i = 0; i <= search_range; i++) {
-                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
+    // 将新一帧数据推入滑动缓存区
+    for (int m = 0; m < NUM_MICS; m++) {
+        for (int bin = start_bin; bin <= end_bin; bin++) {
+            X_history_r[frame_idx][m][bin] = mic_real[m][bin];
+            X_history_i[frame_idx][m][bin] = mic_imag[m][bin];
+        }
+    }
+    frame_idx = (frame_idx + 1) % N_FRAMES;
+    
+    // 如果缓存还没填满 7 帧，无法构建满秩协方差矩阵，先返回上次角度
+    if (frames_collected < N_FRAMES) {
+        frames_collected++;
+        return last_angle;
+    }
+
+    static float P_MUSIC[360] = {0};
+    for (int i = 0; i < 360; i++) P_MUSIC[i] = 0.0f;
+
+    // 2. 遍历每一个有效频点，执行标准的 MUSIC 管线
+    for (int bin = start_bin; bin <= end_bin; bin++) {
+        float freq = bin * df;
+        float omega = 2.0f * PI * freq;
+
+        // --- A. 建立 7x7 协方差矩阵 Rxx ---
+        float Rxx_r[NUM_MICS][NUM_MICS] = {0};
+        float Rxx_i[NUM_MICS][NUM_MICS] = {0};
+
+        for (int f = 0; f < N_FRAMES; f++) {
+            for (int i = 0; i < NUM_MICS; i++) {
+                float xr = X_history_r[f][i][bin];
+                float xi = X_history_i[f][i][bin];
+                for (int j = 0; j < NUM_MICS; j++) {
+                    float yr = X_history_r[f][j][bin];
+                    float yi = X_history_i[f][j][bin];
+                    Rxx_r[i][j] += (xr * yr + xi * yi);
+                    Rxx_i[i][j] += (xi * yr - xr * yi);
+                }
             }
-            for (int i = FFT_N - search_range; i < FFT_N; i++) {
-                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
+        }
+        for (int i = 0; i < NUM_MICS; i++) {
+            for (int j = 0; j < NUM_MICS; j++) {
+                Rxx_r[i][j] /= N_FRAMES;
+                Rxx_i[i][j] /= N_FRAMES;
+            }
+        }
+
+        // --- B. 幂迭代法求解主特征向量 (Signal Subspace V) ---
+        float V_r[NUM_MICS] = {1, 1, 1, 1, 1, 1, 1};
+        float V_i[NUM_MICS] = {0, 0, 0, 0, 0, 0, 0};
+        for (int iter = 0; iter < 20; iter++) {
+            float V_new_r[NUM_MICS] = {0};
+            float V_new_i[NUM_MICS] = {0};
+            float norm_sq = 0.0f;
+            for (int i = 0; i < NUM_MICS; i++) {
+                for (int j = 0; j < NUM_MICS; j++) {
+                    V_new_r[i] += (Rxx_r[i][j] * V_r[j] - Rxx_i[i][j] * V_i[j]);
+                    V_new_i[i] += (Rxx_r[i][j] * V_i[j] + Rxx_i[i][j] * V_r[j]);
+                }
+                norm_sq += (V_new_r[i] * V_new_r[i] + V_new_i[i] * V_new_i[i]);
+            }
+            float norm = sqrtf(norm_sq) + 1e-12f;
+            for (int i = 0; i < NUM_MICS; i++) {
+                V_r[i] = V_new_r[i] / norm;
+                V_i[i] = V_new_i[i] / norm;
+            }
+        }
+
+        // --- C. 构建噪声子空间投影矩阵 Pn = I - V*V^H ---
+        float Pn_r[NUM_MICS][NUM_MICS];
+        float Pn_i[NUM_MICS][NUM_MICS];
+        for (int i = 0; i < NUM_MICS; i++) {
+            for (int j = 0; j < NUM_MICS; j++) {
+                float vvH_r = V_r[i] * V_r[j] + V_i[i] * V_i[j];
+                float vvH_i = V_i[i] * V_r[j] - V_r[i] * V_i[j];
+                if (i == j) {
+                    Pn_r[i][j] = 1.0f - vvH_r;
+                    Pn_i[i][j] = -vvH_i;
+                } else {
+                    Pn_r[i][j] = -vvH_r;
+                    Pn_i[i][j] = -vvH_i;
+                }
+            }
+        }
+
+        // --- D. 全向空间谱扫描 P_music = 1 / (a^H * Pn * a) ---
+        for (int theta = -180; theta < 180; theta++) {
+            float cos_t = cosf(theta * DEG2RAD);
+            float sin_t = sinf(theta * DEG2RAD);
+
+            float a_r[NUM_MICS], a_i[NUM_MICS];
+            for (int m = 0; m < NUM_MICS; m++) {
+                float phase = omega * (mic_pos_x[m] * cos_t + mic_pos_y[m] * sin_t) / SOUND_SPEED;
+                a_r[m] = cosf(phase);
+                a_i[m] = -sinf(phase); 
             }
 
-            float delta = 0;
-            if (max_idx > 0 && max_idx < FFT_N - 1) {
-                float y1 = R_real[max_idx - 1];
-                float y2 = R_real[max_idx];
-                float y3 = R_real[max_idx + 1];
-                float denom = 2.0f * (y1 - 2.0f * y2 + y3);
-                if (fabsf(denom) > 1e-9f) delta = (y1 - y3) / denom;
+            float y_r[NUM_MICS] = {0}, y_i[NUM_MICS] = {0};
+            for (int i = 0; i < NUM_MICS; i++) {
+                for (int j = 0; j < NUM_MICS; j++) {
+                    y_r[i] += (Pn_r[i][j] * a_r[j] - Pn_i[i][j] * a_i[j]);
+                    y_i[i] += (Pn_r[i][j] * a_i[j] + Pn_i[i][j] * a_r[j]);
+                }
             }
-            
-            float tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
-            Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
-            Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
-            k++;
+
+            float val_r = 0.0f;
+            for (int i = 0; i < NUM_MICS; i++) {
+                val_r += (a_r[i] * y_r[i] + a_i[i] * y_i[i]);
+            }
+
+            int theta_idx = theta + 180;
+            P_MUSIC[theta_idx] += 1.0f / (val_r + 1e-12f);
         }
     }
 
-    // 3. 核心差异：全空间粗网格搜索 (Grid Search)
-    float min_cost = FLT_MAX;
-    float best_ang = 0.0f;
-    for (int theta = -180; theta < 180; theta++) {
-        float cost = 0.0f;
-        float cos_t = cosf(theta * DEG2RAD);
-        float sin_t = sinf(theta * DEG2RAD);
-        for (int p = 0; p < NUM_PAIRS; p++) {
-            if (Qual_Score[p] < 1e-3f) continue;
-            float theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
-            float err = theo_tdoa - Meas_TDOA[p];
-            cost += Qual_Score[p] * pair_conf[p].dist * err * err;
+    // 3. 在全频带叠加空间谱中寻找峰值
+    float max_P = 0;
+    float best_ang = 0;
+    for (int i = 0; i < 360; i++) {
+        if (P_MUSIC[i] > max_P) {
+            max_P = P_MUSIC[i];
+            best_ang = (float)(i - 180);
         }
-        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
+    last_angle = best_ang;
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
     if (final_ang < 0) final_ang += 360.0f;
     return final_ang - 180.0f;
 }
 
 // ============================================================================
-// 第三部分：核心 API 与异步并行接口 (外壳严格不变)
+// 第三部分：核心 API 与异步并行接口 (严密锁死不变)
 // ============================================================================
 static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
 
@@ -271,7 +364,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
 
-// 雷达兵接口：GIL 解锁 + 运行 GCC-PHAT 网格搜索
+// 雷达兵接口：GIL 解锁 + 运行 Broadband MUSIC
 STATIC mp_obj_t Maix_mic_array_track_doa(void) {
     if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
 

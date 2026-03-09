@@ -32,7 +32,7 @@
 #define FFT_N 1024
 #define NUM_MICS 7       
 #define NUM_PAIRS 21     
-#define SAMPLE_RATE 48000.0f
+#define SAMPLE_RATE 16000.0f
 #define SOUND_SPEED 343.0f
 #undef PI
 #define PI 3.14159265358979323846f

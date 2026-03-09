@@ -27,12 +27,12 @@
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：全局变量与双核异步共享内存
+// 第一部分：全局变量与双核异步共享内存 (基准：严格保持一致)
 // ============================================================================
 #define FFT_N 1024
 #define NUM_MICS 7       
 #define NUM_PAIRS 21     
-#define SAMPLE_RATE 16000.0f  // 严格设定为 16000Hz
+#define SAMPLE_RATE 16000.0f  // 严格设定为 16000Hz 防丢帧
 #define SOUND_SPEED 343.0f
 #undef PI
 #define PI 3.14159265358979323846f
@@ -101,23 +101,8 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
-static float calculate_median(float* array, int size) {
-    float temp[NUM_PAIRS];
-    int i, j;
-    float swap;
-    for(i = 0; i < size; i++) temp[i] = array[i];
-    for (i = 0; i < size - 1; i++) {
-        for (j = 0; j < size - i - 1; j++) {
-            if (temp[j] > temp[j + 1]) {
-                swap = temp[j]; temp[j] = temp[j + 1]; temp[j + 1] = swap;
-            }
-        }
-    }
-    return temp[size / 2];
-}
-
 // ============================================================================
-// 第二部分：时空级联核心管线 (变量声明已全部移至顶层，完美兼容 C90)
+// 第二部分：时空级联核心管线 (核心替换：GCC-PHAT + 卡尔曼)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
@@ -125,21 +110,20 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float Meas_TDOA[NUM_PAIRS];
     float Qual_Score[NUM_PAIRS];
     static float R_real[FFT_N], R_imag[FFT_N];
-    int m, i, u, v, k, p, iter, theta, max_idx, search_range, valid_count;
+    
+    // C90 严苛规范：所有变量均在顶部声明
+    int m, i, u, v, k, p, theta, max_idx, search_range;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float min_cost, ang_coarse, cost, cos_t, sin_t, theo_tdoa, err;
-    float raw_residuals_t[NUM_PAIRS]; 
-    float cos_coarse, sin_coarse, med_res_m, sigma_adaptive_m, sigma_adaptive_t;
-    float Final_W[NUM_PAIRS], res_sq, w_consist;
-    float ang_gn, raw_angle;
-    float sum_WJr, sum_WJJ, cos_gn, sin_gn, r_p, J_p, delta_ang;
+    float min_cost, best_ang, cost, cos_t, sin_t, theo_tdoa, err;
+    float raw_angle;
 
-    // 所有变量均已声明，逻辑正式开始
+    // 变量初始化
     k = 0;
     min_cost = FLT_MAX;
-    ang_coarse = 0.0f;
-    for(i=0; i<NUM_PAIRS; i++) { Meas_TDOA[i]=0.0f; Qual_Score[i]=0.0f; }
+    best_ang = 0.0f;
+    for(i = 0; i < NUM_PAIRS; i++) { Meas_TDOA[i] = 0.0f; Qual_Score[i] = 0.0f; }
 
+    // 1. 加窗与正向 FFT
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -149,19 +133,16 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
+    // 2. GCC-PHAT 提取时间差 (TDOA)
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
-            max_val = 0; 
-            max_idx = 0; 
-            search_range = 8; 
-            delta = 0;
+            max_val = 0; max_idx = 0; search_range = 8; delta = 0;
 
             for (i = 0; i < FFT_N; i++) {
                 cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
                 cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
                 mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; 
-                R_imag[i] = cross_i / mag;
+                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
             
@@ -180,88 +161,44 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
+    // 3. 【核心替换】：GCC-PHAT 网格搜索法 (Grid Search) 寻找最小误差角度
     for (theta = -180; theta < 180; theta++) {
-        cost = 0.0f; 
-        cos_t = cosf(theta * DEG2RAD); 
-        sin_t = sinf(theta * DEG2RAD);
+        cost = 0.0f; cos_t = cosf(theta * DEG2RAD); sin_t = sinf(theta * DEG2RAD);
         for (p = 0; p < NUM_PAIRS; p++) {
             if (Qual_Score[p] < 1e-3f) continue;
             theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
             err = theo_tdoa - Meas_TDOA[p];
             cost += Qual_Score[p] * pair_conf[p].dist * err * err;
         }
-        if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
+        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
-    cos_coarse = cosf(ang_coarse * DEG2RAD); 
-    sin_coarse = sinf(ang_coarse * DEG2RAD);
-    for (p = 0; p < NUM_PAIRS; p++) {
-        theo_tdoa = (pair_conf[p].dx * cos_coarse + pair_conf[p].dy * sin_coarse) / SOUND_SPEED;
-        raw_residuals_t[p] = fabsf(Meas_TDOA[p] - theo_tdoa);
-    }
-
-    med_res_m = calculate_median(raw_residuals_t, NUM_PAIRS) * SOUND_SPEED;
-    sigma_adaptive_m = med_res_m * 1.5f;
-    if (sigma_adaptive_m < 0.015f) sigma_adaptive_m = 0.015f;
-    if (sigma_adaptive_m > 0.10f) sigma_adaptive_m = 0.10f;
-    sigma_adaptive_t = sigma_adaptive_m / SOUND_SPEED;
-
-    for (p = 0; p < NUM_PAIRS; p++) {
-        res_sq = raw_residuals_t[p] * raw_residuals_t[p];
-        w_consist = expf(-res_sq / (2.0f * sigma_adaptive_t * sigma_adaptive_t));
-        Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
-    }
-
-    ang_gn = ang_coarse;
-    for (iter = 0; iter < 8; iter++) {
-        sum_WJr = 0.0f; sum_WJJ = 0.0f; valid_count = 0;
-        cos_gn = cosf(ang_gn * DEG2RAD); sin_gn = sinf(ang_gn * DEG2RAD);
-        for (p = 0; p < NUM_PAIRS; p++) {
-            if (Final_W[p] < 1e-4f) continue;
-            valid_count++;
-            theo_tdoa = (pair_conf[p].dx * cos_gn + pair_conf[p].dy * sin_gn) / SOUND_SPEED;
-            r_p = theo_tdoa - Meas_TDOA[p];
-            J_p = DEG2RAD * (-pair_conf[p].dx * sin_gn + pair_conf[p].dy * cos_gn) / SOUND_SPEED;
-            sum_WJr += Final_W[p] * J_p * r_p; 
-            sum_WJJ += Final_W[p] * J_p * J_p;
-        }
-        if (valid_count < 3) break;
-        delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
-        ang_gn += delta_ang; 
-        if (fabsf(delta_ang) < 1e-3f) break;
-    }
-    
-    raw_angle = fmodf(ang_gn + 180.0f, 360.0f);
+    raw_angle = fmodf(best_ang + 180.0f, 360.0f);
     if (raw_angle < 0) raw_angle += 360.0f;
     raw_angle -= 180.0f;
 
     // ============================================================================
-    // 【核心注入】：新建专属作用域，解决卡尔曼变量的 declaration-after-statement 报错
+    // 4. 【系统锁定】：鲁棒 Alpha-Beta 卡尔曼滤波器 (完全继承 M-估计版的防瞬移代码)
     // ============================================================================
     {
         static int tracker_initialized = 0;
         static float est_angle = 0.0f;
         static float est_velocity = 0.0f;
-        static uint32_t last_time_ms = 0;
         
         const float ALPHA = 0.3f;           
         const float BETA  = 0.02f;          
         const float HUBER_THRESH = 15.0f;   
+        // 16000Hz 采样率下，处理 1024 个点的严格物理耗时为 0.064 秒
+        const float dt = 0.064f; 
         
-        uint32_t current_time_ms = mp_hal_ticks_ms();
-        float dt, pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
+        float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
         if (!tracker_initialized) {
             est_angle = raw_angle;
             est_velocity = 0.0f;
-            last_time_ms = current_time_ms;
             tracker_initialized = 1;
             return est_angle;
         }
-
-        dt = (current_time_ms - last_time_ms) / 1000.0f;
-        if (dt <= 0.001f) dt = 0.01f;
-        last_time_ms = current_time_ms;
 
         pred_angle = est_angle + est_velocity * dt;
 
@@ -287,7 +224,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 }
 
 // ============================================================================
-// 第三部分：核心 API 与异步并行接口 (C90规范修复)
+// 第三部分：核心 API 与异步并行接口 (C90规范修复版，完全锁定不变)
 // ============================================================================
 static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
 
@@ -404,21 +341,16 @@ MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_track_doa_obj, Maix_mic_array_track_doa
 
 STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0}; 
-    mp_obj_t *items;
-    uint32_t set_color;
-    
+    mp_obj_t *items; uint32_t set_color;
     mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
     for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
     mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
     for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
-    
     set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
     for (index = 0; index < 12; index++) led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
-    
     sysctl_disable_irq(); sk9822_start_frame();
     for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
     sk9822_stop_frame(); sysctl_enable_irq();
-    
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);

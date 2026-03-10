@@ -40,7 +40,9 @@
 #include "uarths.h"
 #include "esp8285.h"
 #include "sleep.h"
-
+#ifdef configASSERT
+#undef configASSERT
+#endif
 
 STATIC void kmp_get_next(const char* targe, int next[])
 {  

@@ -38,7 +38,7 @@
 #define PI 3.14159265358979323846f
 #define DEG2RAD (PI / 180.0f)
 
-// 算法轻量化核心宏定义 (MVDR 使用)
+// MVDR 算法轻量化核心宏定义
 #define UPDATE_INTERVAL 4  
 #define FREQ_BIN_START 51  
 #define FREQ_BIN_END 224   
@@ -111,7 +111,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
-// 7x7 复数矩阵求逆 (Gauss-Jordan消元法，MVDR 专用)
+// 7x7 复数矩阵求逆 (MVDR 专用)
 static int invert_7x7_complex(float mat_r[NUM_MICS][NUM_MICS], float mat_i[NUM_MICS][NUM_MICS], 
                               float inv_r[NUM_MICS][NUM_MICS], float inv_i[NUM_MICS][NUM_MICS]) {
     int i, j, k;
@@ -153,80 +153,204 @@ static int invert_7x7_complex(float mat_r[NUM_MICS][NUM_MICS], float mat_i[NUM_M
 }
 
 // ============================================================================
-// 第二部分：DOA 定位追踪管线 (【已替换】: GCC-PHAT 网格搜索 + 鲁棒卡尔曼)
+// 第二部分：DOA 定位追踪管线 (【内核替换】: Broadband MUSIC + 鲁棒卡尔曼)
 // ============================================================================
+
+// MUSIC 算法专属静态滑动窗口，缓存 7 帧 FFT 频谱数据
+#define N_FRAMES 7
+#define MAX_BINS 200
+static float X_history_r[N_FRAMES][NUM_MICS][MAX_BINS];
+static float X_history_i[N_FRAMES][NUM_MICS][MAX_BINS];
+static int frame_idx = 0;
+static int frames_collected = 0;
+static float last_angle = 0.0f;
+
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    // C90 严格规范：所有变量在最顶层声明
+    // -------------------------------------------------------------
+    // 【C90 严苛规范】：将 MUSIC 算法所有海量变量在函数最顶层声明
+    // -------------------------------------------------------------
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
-    float Meas_TDOA[NUM_PAIRS];
-    float Qual_Score[NUM_PAIRS];
-    static float R_real[FFT_N], R_imag[FFT_N];
+    static float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
+    static int geom_init = 0;
+    static float P_MUSIC[360];
+
+    int m, i, j, f, bin, iter, theta, theta_idx;
+    float window, df, freq, omega, phase;
+    int start_bin, end_bin;
     
-    int m, i, u, v, k, p, theta, max_idx, search_range;
-    float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float min_cost, cost, cos_t, sin_t, theo_tdoa, err, best_ang, raw_angle;
+    float Rxx_r[NUM_MICS][NUM_MICS], Rxx_i[NUM_MICS][NUM_MICS];
+    float xr, xi, yr, yi;
+    float V_r[NUM_MICS], V_i[NUM_MICS], V_new_r[NUM_MICS], V_new_i[NUM_MICS];
+    float norm_sq, norm, vvH_r, vvH_i;
+    float Pn_r[NUM_MICS][NUM_MICS], Pn_i[NUM_MICS][NUM_MICS];
+    float cos_t, sin_t;
+    float a_r[NUM_MICS], a_i[NUM_MICS];
+    float y_r[NUM_MICS], y_i[NUM_MICS];
+    float val_r, max_P, best_ang, raw_angle;
 
-    k = 0;
-    min_cost = FLT_MAX;
-    best_ang = 0.0f;
-    for(i=0; i<NUM_PAIRS; i++) { Meas_TDOA[i]=0.0f; Qual_Score[i]=0.0f; }
+    // 1. 物理阵列坐标初始化
+    if (!geom_init) {
+        for (i = 0; i < 6; i++) {
+            mic_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
+            mic_pos_y[i] = 0.04f * sinf(i * 60.0f * DEG2RAD);
+        }
+        mic_pos_x[6] = 0.0f; mic_pos_y[6] = 0.0f;
+        geom_init = 1;
+    }
 
-    // 1. 加窗与正向 FFT
+    // 2. 加窗与正向 FFT
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
-            mic_real[m][i] = mic_data[m][i] * window; 
+            mic_real[m][i] = mic_data[m][i] * window;
             mic_imag[m][i] = 0.0f;
         }
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 2. GCC-PHAT 计算到达时间差 (TDOA)
-    for (u = 0; u < NUM_MICS; u++) {
-        for (v = u + 1; v < NUM_MICS; v++) {
-            max_val = 0; max_idx = 0; search_range = 8; delta = 0;
-            for (i = 0; i < FFT_N; i++) {
-                cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
-                cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
-                mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
+    df = SAMPLE_RATE / FFT_N;
+    start_bin = (int)ceilf(50.0f / df);
+    end_bin = (int)floorf(8000.0f / df);
+    if(end_bin >= MAX_BINS) end_bin = MAX_BINS - 1;
+
+    // 3. 将新一帧数据推入 7 帧滑动缓存区
+    for (m = 0; m < NUM_MICS; m++) {
+        for (bin = start_bin; bin <= end_bin; bin++) {
+            X_history_r[frame_idx][m][bin] = mic_real[m][bin];
+            X_history_i[frame_idx][m][bin] = mic_imag[m][bin];
+        }
+    }
+    frame_idx = (frame_idx + 1) % N_FRAMES;
+    
+    // 如果缓存还没填满，无法构建满秩协方差矩阵，返回历史角度
+    if (frames_collected < N_FRAMES) {
+        frames_collected++;
+        return last_angle;
+    }
+
+    for (i = 0; i < 360; i++) P_MUSIC[i] = 0.0f;
+
+    // 4. 【核心管线】：宽带 MUSIC 特征分解
+    for (bin = start_bin; bin <= end_bin; bin++) {
+        freq = bin * df;
+        omega = 2.0f * PI * freq;
+
+        // A. 初始化并计算协方差矩阵
+        for (i = 0; i < NUM_MICS; i++) {
+            for (j = 0; j < NUM_MICS; j++) {
+                Rxx_r[i][j] = 0.0f;
+                Rxx_i[i][j] = 0.0f;
             }
-            fft_radix2(R_real, R_imag, FFT_N, 1);
-            
-            for (i = 0; i <= search_range; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
-            for (i = FFT_N - search_range; i < FFT_N; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
-            
-            if (max_idx > 0 && max_idx < FFT_N - 1) {
-                y1 = R_real[max_idx - 1]; y2 = R_real[max_idx]; y3 = R_real[max_idx + 1];
-                denom = 2.0f * (y1 - 2.0f * y2 + y3);
-                if (fabsf(denom) > 1e-9f) delta = (y1 - y3) / denom;
+            V_r[i] = 1.0f;
+            V_i[i] = 0.0f;
+        }
+
+        for (f = 0; f < N_FRAMES; f++) {
+            for (i = 0; i < NUM_MICS; i++) {
+                xr = X_history_r[f][i][bin];
+                xi = X_history_i[f][i][bin];
+                for (j = 0; j < NUM_MICS; j++) {
+                    yr = X_history_r[f][j][bin];
+                    yi = X_history_i[f][j][bin];
+                    Rxx_r[i][j] += (xr * yr + xi * yi);
+                    Rxx_i[i][j] += (xi * yr - xr * yi);
+                }
             }
-            tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
-            Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
-            Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
-            k++;
+        }
+        for (i = 0; i < NUM_MICS; i++) {
+            for (j = 0; j < NUM_MICS; j++) {
+                Rxx_r[i][j] /= N_FRAMES;
+                Rxx_i[i][j] /= N_FRAMES;
+            }
+        }
+
+        // B. 幂迭代法求解信号子空间 (Signal Subspace)
+        for (iter = 0; iter < 20; iter++) {
+            norm_sq = 0.0f;
+            for (i = 0; i < NUM_MICS; i++) {
+                V_new_r[i] = 0.0f;
+                V_new_i[i] = 0.0f;
+            }
+            for (i = 0; i < NUM_MICS; i++) {
+                for (j = 0; j < NUM_MICS; j++) {
+                    V_new_r[i] += (Rxx_r[i][j] * V_r[j] - Rxx_i[i][j] * V_i[j]);
+                    V_new_i[i] += (Rxx_r[i][j] * V_i[j] + Rxx_i[i][j] * V_r[j]);
+                }
+                norm_sq += (V_new_r[i] * V_new_r[i] + V_new_i[i] * V_new_i[i]);
+            }
+            norm = sqrtf(norm_sq) + 1e-12f;
+            for (i = 0; i < NUM_MICS; i++) {
+                V_r[i] = V_new_r[i] / norm;
+                V_i[i] = V_new_i[i] / norm;
+            }
+        }
+
+        // C. 构建噪声子空间投影矩阵 Pn
+        for (i = 0; i < NUM_MICS; i++) {
+            for (j = 0; j < NUM_MICS; j++) {
+                vvH_r = V_r[i] * V_r[j] + V_i[i] * V_i[j];
+                vvH_i = V_i[i] * V_r[j] - V_r[i] * V_i[j];
+                if (i == j) {
+                    Pn_r[i][j] = 1.0f - vvH_r;
+                    Pn_i[i][j] = -vvH_i;
+                } else {
+                    Pn_r[i][j] = -vvH_r;
+                    Pn_i[i][j] = -vvH_i;
+                }
+            }
+        }
+
+        // D. 空间谱扫描
+        for (theta = -180; theta < 180; theta++) {
+            cos_t = cosf(theta * DEG2RAD);
+            sin_t = sinf(theta * DEG2RAD);
+
+            for (m = 0; m < NUM_MICS; m++) {
+                phase = omega * (mic_pos_x[m] * cos_t + mic_pos_y[m] * sin_t) / SOUND_SPEED;
+                a_r[m] = cosf(phase);
+                a_i[m] = -sinf(phase); // 绝杀修复：加上负号补偿 FFT 共轭
+            }
+
+            for (i = 0; i < NUM_MICS; i++) {
+                y_r[i] = 0.0f;
+                y_i[i] = 0.0f;
+            }
+
+            for (i = 0; i < NUM_MICS; i++) {
+                for (j = 0; j < NUM_MICS; j++) {
+                    y_r[i] += (Pn_r[i][j] * a_r[j] - Pn_i[i][j] * a_i[j]);
+                    y_i[i] += (Pn_r[i][j] * a_i[j] + Pn_i[i][j] * a_r[j]);
+                }
+            }
+
+            val_r = 0.0f;
+            for (i = 0; i < NUM_MICS; i++) {
+                val_r += (a_r[i] * y_r[i] + a_i[i] * y_i[i]);
+            }
+
+            theta_idx = theta + 180;
+            P_MUSIC[theta_idx] += 1.0f / (val_r + 1e-12f);
         }
     }
 
-    // 3. 全空间网格搜索 (Grid Search)
-    for (theta = -180; theta < 180; theta++) {
-        cost = 0.0f; cos_t = cosf(theta * DEG2RAD); sin_t = sinf(theta * DEG2RAD);
-        for (p = 0; p < NUM_PAIRS; p++) {
-            if (Qual_Score[p] < 1e-3f) continue;
-            theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
-            err = theo_tdoa - Meas_TDOA[p];
-            cost += Qual_Score[p] * pair_conf[p].dist * err * err;
+    // 5. 寻找最优角度
+    max_P = 0.0f;
+    best_ang = 0.0f;
+    for (i = 0; i < 360; i++) {
+        if (P_MUSIC[i] > max_P) {
+            max_P = P_MUSIC[i];
+            best_ang = (float)(i - 180);
         }
-        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
+    last_angle = best_ang;
     raw_angle = fmodf(best_ang + 180.0f, 360.0f);
     if (raw_angle < 0) raw_angle += 360.0f;
     raw_angle -= 180.0f;
 
     // ============================================================================
-    // 4. 系统锁定：鲁棒 Alpha-Beta 卡尔曼滤波器 (完全继承，防瞬移)
+    // 6. 【系统锁定】：鲁棒 Alpha-Beta 卡尔曼滤波器 (完全继承，防瞬移)
     // ============================================================================
     {
         static int tracker_initialized = 0;
@@ -236,28 +360,34 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         const float ALPHA = 0.3f;           
         const float BETA  = 0.02f;          
         const float HUBER_THRESH = 15.0f;   
-        // 16000Hz 采样率下，处理 1024 个点的严格物理耗时为 0.064 秒
+        // 16000Hz 采样率下，严格物理耗时 dt = 0.064 秒
         const float dt = 0.064f; 
         
         float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
         if (!tracker_initialized) {
-            est_angle = raw_angle; est_velocity = 0.0f;
-            tracker_initialized = 1; return est_angle;
+            est_angle = raw_angle;
+            est_velocity = 0.0f;
+            tracker_initialized = 1;
+            return est_angle;
         }
 
         pred_angle = est_angle + est_velocity * dt;
+
         raw_residual = raw_angle - pred_angle;
         while (raw_residual > 180.0f)  raw_residual -= 360.0f;
         while (raw_residual < -180.0f) raw_residual += 360.0f;
 
         abs_res = fabsf(raw_residual);
-        robust_weight = (abs_res > HUBER_THRESH) ? (HUBER_THRESH / abs_res) : 1.0f;
+        robust_weight = 1.0f;
+        if (abs_res > HUBER_THRESH) {
+            robust_weight = HUBER_THRESH / abs_res;
+        }
         robust_residual = raw_residual * robust_weight;
 
         est_angle = pred_angle + ALPHA * robust_residual;
         est_velocity = est_velocity + BETA * (robust_residual / dt);
-        
+
         while (est_angle > 180.0f)  est_angle -= 360.0f;
         while (est_angle < -180.0f) est_angle += 360.0f;
 
@@ -266,7 +396,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 }
 
 // ============================================================================
-// 第三部分：核心 API (包含极速轻量化 Robust MVDR 波束成型与外设接口)
+// 第三部分：核心 API (极速轻量化 Robust MVDR 波束成型与外设接口)
 // ============================================================================
 static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
 
@@ -297,6 +427,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     static float out_r[FFT_N], out_i[FFT_N];
     static int16_t pcm_out[FFT_N];
     
+    // 轻量化核心变量
     static int frame_counter = 0;
     int update_weights;
     
@@ -304,7 +435,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     float target_angle, cos_t, sin_t, freq, omega, tau, phase, bin_energy, rho;
     float temp_r[NUM_MICS][NUM_MICS], temp_i[NUM_MICS][NUM_MICS];
     float inv_r[NUM_MICS][NUM_MICS], inv_i[NUM_MICS][NUM_MICS];
-    float a_r[NUM_MICS], a_i[NUM_MICS], v_r[NUM_MICS], v_i[NUM_MICS];
+    float a_r[NUM_MICS], a_i[NUM_MICS], v_r[NUM_MICS], v_i[NUM_MICS], w_r[NUM_MICS], w_i[NUM_MICS];
     float denom_r, denom_i, out_val_r, out_val_i, cross_r, cross_i;
     
     const float ALPHA = 0.8f;      
@@ -315,6 +446,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 
     mp_obj_t tuple[2];
 
+    // 判断是否需要进行耗时的矩阵求逆（降频策略）
     update_weights = (frame_counter % UPDATE_INTERVAL == 0) ? 1 : 0;
     frame_counter++;
 
@@ -372,7 +504,14 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
             a_i[m] = -sinf(phase); 
         }
 
+        // ==========================================
+        // 核心优化 1：频带截断处理 (800Hz - 3500Hz)
+        // ==========================================
         if (k >= FREQ_BIN_START && k <= FREQ_BIN_END) {
+            
+            // ==========================================
+            // 核心优化 2：权重更新降频
+            // ==========================================
             if (update_weights) {
                 bin_energy = 0;
                 for(m = 0; m < NUM_MICS; m++) bin_energy += (mic_r[m][k]*mic_r[m][k] + mic_i[m][k]*mic_i[m][k]);
@@ -407,18 +546,24 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
                     denom_i += a_r[m]*v_i[m] - a_i[m]*v_r[m];
                 }
 
+                // 计算并静态保存最新权重
                 for(m = 0; m < NUM_MICS; m++) {
                     w_r_saved[k][m] = (v_r[m]*denom_r + v_i[m]*denom_i) / (denom_r*denom_r + denom_i*denom_i + 1e-12f);
                     w_i_saved[k][m] = (v_i[m]*denom_r - v_r[m]*denom_i) / (denom_r*denom_r + denom_i*denom_i + 1e-12f);
                 }
             }
 
+            // 应用 MVDR 权重进行空间滤波 (无论是否更新，都用现存权重)
             out_val_r = 0; out_val_i = 0;
             for(m = 0; m < NUM_MICS; m++) {
                 out_val_r += w_r_saved[k][m]*mic_r[m][k] + w_i_saved[k][m]*mic_i[m][k];
                 out_val_i += w_r_saved[k][m]*mic_i[m][k] - w_i_saved[k][m]*mic_r[m][k];
             }
+
         } else {
+            // ==========================================
+            // 非核心频带：极低算力的标准 DAS 叠加
+            // ==========================================
             out_val_r = 0; out_val_i = 0;
             for(m = 0; m < NUM_MICS; m++) {
                 out_val_r += (a_r[m]*mic_r[m][k] + a_i[m]*mic_i[m][k]) / 7.0f;

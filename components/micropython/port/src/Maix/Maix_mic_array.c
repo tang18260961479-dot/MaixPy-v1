@@ -32,11 +32,16 @@
 #define FFT_N 1024
 #define NUM_MICS 7       
 #define NUM_PAIRS 21     
-#define SAMPLE_RATE 16000.0f  // 严格设定为 16000Hz
+#define SAMPLE_RATE 16000.0f
 #define SOUND_SPEED 343.0f
 #undef PI
 #define PI 3.14159265358979323846f
 #define DEG2RAD (PI / 180.0f)
+
+// 算法轻量化核心宏定义
+#define UPDATE_INTERVAL 4  // 每 4 帧更新一次矩阵求逆 (降频 75%)
+#define FREQ_BIN_START 51  // 截断起点: 约 800Hz  (51 * 16000/1024)
+#define FREQ_BIN_END 224   // 截断终点: 约 3500Hz (224 * 16000/1024)
 
 typedef struct { int u; int v; float dist; float dx; float dy; } MicPairConf;
 MicPairConf pair_conf[NUM_PAIRS];
@@ -48,9 +53,11 @@ static volatile float current_target_angle = 0.0f;
 static float shared_doa_mic_data[NUM_MICS][FFT_N];     
 static volatile int shared_data_ready = 0;             
 
-// MVDR 专用的空间协方差矩阵 (SCM)，静态分配至 BSS 段防止爆栈
+// MVDR 空间协方差矩阵 (SCM) 与静态权重缓存
 static float R_mat_r[FFT_N/2][NUM_MICS][NUM_MICS];
 static float R_mat_i[FFT_N/2][NUM_MICS][NUM_MICS];
+static float w_r_saved[FFT_N/2][NUM_MICS];
+static float w_i_saved[FFT_N/2][NUM_MICS];
 static int mvdr_initialized = 0;
 
 static void init_array_geometry(void) {
@@ -104,7 +111,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
-// 7x7 复数矩阵求逆 (Gauss-Jordan消元法)，用于 MVDR 核心计算
+// 7x7 复数矩阵求逆 (Gauss-Jordan消元法)
 static int invert_7x7_complex(float mat_r[NUM_MICS][NUM_MICS], float mat_i[NUM_MICS][NUM_MICS], 
                               float inv_r[NUM_MICS][NUM_MICS], float inv_i[NUM_MICS][NUM_MICS]) {
     int i, j, k;
@@ -159,7 +166,7 @@ static float calculate_median(float* array, int size) {
 }
 
 // ============================================================================
-// 第二部分：DOA 定位追踪管线 (包含 GCC-PHAT 与卡尔曼稳健追踪)
+// 第二部分：DOA 定位追踪管线 (GCC-PHAT + 卡尔曼)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
@@ -192,17 +199,12 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
-            max_val = 0; 
-            max_idx = 0; 
-            search_range = 8; 
-            delta = 0;
-
+            max_val = 0; max_idx = 0; search_range = 8; delta = 0;
             for (i = 0; i < FFT_N; i++) {
                 cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
                 cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
                 mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; 
-                R_imag[i] = cross_i / mag;
+                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
             
@@ -222,9 +224,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     }
 
     for (theta = -180; theta < 180; theta++) {
-        cost = 0.0f; 
-        cos_t = cosf(theta * DEG2RAD); 
-        sin_t = sinf(theta * DEG2RAD);
+        cost = 0.0f; cos_t = cosf(theta * DEG2RAD); sin_t = sinf(theta * DEG2RAD);
         for (p = 0; p < NUM_PAIRS; p++) {
             if (Qual_Score[p] < 1e-3f) continue;
             theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
@@ -234,8 +234,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
     }
 
-    cos_coarse = cosf(ang_coarse * DEG2RAD); 
-    sin_coarse = sinf(ang_coarse * DEG2RAD);
+    cos_coarse = cosf(ang_coarse * DEG2RAD); sin_coarse = sinf(ang_coarse * DEG2RAD);
     for (p = 0; p < NUM_PAIRS; p++) {
         theo_tdoa = (pair_conf[p].dx * cos_coarse + pair_conf[p].dy * sin_coarse) / SOUND_SPEED;
         raw_residuals_t[p] = fabsf(Meas_TDOA[p] - theo_tdoa);
@@ -263,8 +262,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             theo_tdoa = (pair_conf[p].dx * cos_gn + pair_conf[p].dy * sin_gn) / SOUND_SPEED;
             r_p = theo_tdoa - Meas_TDOA[p];
             J_p = DEG2RAD * (-pair_conf[p].dx * sin_gn + pair_conf[p].dy * cos_gn) / SOUND_SPEED;
-            sum_WJr += Final_W[p] * J_p * r_p; 
-            sum_WJJ += Final_W[p] * J_p * J_p;
+            sum_WJr += Final_W[p] * J_p * r_p; sum_WJJ += Final_W[p] * J_p * J_p;
         }
         if (valid_count < 3) break;
         delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
@@ -281,20 +279,13 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         static float est_angle = 0.0f;
         static float est_velocity = 0.0f;
         static uint32_t last_time_ms = 0;
-        
-        const float ALPHA = 0.3f;           
-        const float BETA  = 0.02f;          
-        const float HUBER_THRESH = 15.0f;   
-        
+        const float ALPHA = 0.3f, BETA = 0.02f, HUBER_THRESH = 15.0f;   
         uint32_t current_time_ms = mp_hal_ticks_ms();
         float dt, pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
         if (!tracker_initialized) {
-            est_angle = raw_angle;
-            est_velocity = 0.0f;
-            last_time_ms = current_time_ms;
-            tracker_initialized = 1;
-            return est_angle;
+            est_angle = raw_angle; est_velocity = 0.0f; last_time_ms = current_time_ms;
+            tracker_initialized = 1; return est_angle;
         }
 
         dt = (current_time_ms - last_time_ms) / 1000.0f;
@@ -302,21 +293,16 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         last_time_ms = current_time_ms;
 
         pred_angle = est_angle + est_velocity * dt;
-
         raw_residual = raw_angle - pred_angle;
         while (raw_residual > 180.0f)  raw_residual -= 360.0f;
         while (raw_residual < -180.0f) raw_residual += 360.0f;
 
         abs_res = fabsf(raw_residual);
-        robust_weight = 1.0f;
-        if (abs_res > HUBER_THRESH) {
-            robust_weight = HUBER_THRESH / abs_res;
-        }
+        robust_weight = (abs_res > HUBER_THRESH) ? (HUBER_THRESH / abs_res) : 1.0f;
         robust_residual = raw_residual * robust_weight;
 
         est_angle = pred_angle + ALPHA * robust_residual;
         est_velocity = est_velocity + BETA * (robust_residual / dt);
-
         while (est_angle > 180.0f)  est_angle -= 360.0f;
         while (est_angle < -180.0f) est_angle += 360.0f;
 
@@ -325,15 +311,14 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 }
 
 // ============================================================================
-// 第三部分：核心 API (包含频域 Robust MVDR 波束成型与外设接口)
+// 第三部分：核心 API (极速轻量化 Robust MVDR 波束成型与外设接口)
 // ============================================================================
 static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
 
 STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_i2s_d0, ARG_i2s_d1, ARG_i2s_d2, ARG_i2s_d3, ARG_i2s_ws, ARG_i2s_sclk, ARG_sk9822_dat, ARG_sk9822_clk, };
     static const mp_arg_t allowed_args[]={{MP_QSTR_i2s_d0, MP_ARG_INT, {.u_int = 23}}, {MP_QSTR_i2s_d1, MP_ARG_INT, {.u_int = 22}}, {MP_QSTR_i2s_d2, MP_ARG_INT, {.u_int = 21}}, {MP_QSTR_i2s_d3, MP_ARG_INT, {.u_int = 20}}, {MP_QSTR_i2s_ws, MP_ARG_INT, {.u_int = 19}}, {MP_QSTR_i2s_sclk, MP_ARG_INT, {.u_int = 18}}, {MP_QSTR_sk9822_dat, MP_ARG_INT, {.u_int = 24}}, {MP_QSTR_sk9822_clk, MP_ARG_INT, {.u_int = 25}},};
-    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)]; 
-    int i;
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)]; int i;
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
     fpioa_set_function(args[ARG_i2s_d0].u_int, FUNC_I2S0_IN_D0); fpioa_set_function(args[ARG_i2s_d1].u_int, FUNC_I2S0_IN_D1); fpioa_set_function(args[ARG_i2s_d2].u_int, FUNC_I2S0_IN_D2); fpioa_set_function(args[ARG_i2s_d3].u_int, FUNC_I2S0_IN_D3); fpioa_set_function(args[ARG_i2s_ws].u_int, FUNC_I2S0_WS); fpioa_set_function(args[ARG_i2s_sclk].u_int, FUNC_I2S0_SCLK); fpioa_set_function(args[ARG_sk9822_dat].u_int, FUNC_GPIOHS0 + SK9822_DAT_GPIONUM); fpioa_set_function(args[ARG_sk9822_clk].u_int, FUNC_GPIOHS0 + SK9822_CLK_GPIONUM);
     sipeed_init_mic_array_led();
@@ -357,6 +342,10 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     static float out_r[FFT_N], out_i[FFT_N];
     static int16_t pcm_out[FFT_N];
     
+    // 轻量化核心变量
+    static int frame_counter = 0;
+    int update_weights;
+    
     int i, m, n, k;
     float target_angle, cos_t, sin_t, freq, omega, tau, phase, bin_energy, rho;
     float temp_r[NUM_MICS][NUM_MICS], temp_i[NUM_MICS][NUM_MICS];
@@ -372,25 +361,24 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 
     mp_obj_t tuple[2];
 
+    // 判断是否需要进行耗时的矩阵求逆（降频策略）
+    update_weights = (frame_counter % UPDATE_INTERVAL == 0) ? 1 : 0;
+    frame_counter++;
+
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
     for (i = 0; i < FFT_N; i++) {
-        mic_r[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
-        mic_r[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
-        mic_r[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
-        mic_r[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
-        mic_r[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
-        mic_r[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
+        mic_r[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16); mic_r[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
+        mic_r[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16); mic_r[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
+        mic_r[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16); mic_r[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
         mic_r[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); 
         for(m=0; m<NUM_MICS; m++) mic_i[m][i] = 0.0f;
     }
 
     if (shared_data_ready == 0) {
-        for(m=0; m<NUM_MICS; m++) {
-            for(i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_r[m][i];
-        }
+        for(m=0; m<NUM_MICS; m++) { for(i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_r[m][i]; }
         shared_data_ready = 1; 
     }
 
@@ -403,6 +391,8 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
                     R_mat_r[k][m][n] = (m == n) ? 1.0f : 0.0f;
                     R_mat_i[k][m][n] = 0.0f;
                 }
+                w_r_saved[k][m] = 1.0f / NUM_MICS; 
+                w_i_saved[k][m] = 0.0f;
             }
         }
         mvdr_initialized = 1;
@@ -420,25 +410,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     out_r[FFT_N/2] = 0; out_i[FFT_N/2] = 0; 
 
     for (k = 1; k < FFT_N/2; k++) {
-        bin_energy = 0;
-        for(m = 0; m < NUM_MICS; m++) {
-            bin_energy += (mic_r[m][k]*mic_r[m][k] + mic_i[m][k]*mic_i[m][k]);
-        }
-        rho = NUM_MICS / (bin_energy + 1e-6f); 
-
-        for(m = 0; m < NUM_MICS; m++) {
-            for(n = 0; n < NUM_MICS; n++) {
-                cross_r = mic_r[m][k]*mic_r[n][k] + mic_i[m][k]*mic_i[n][k]; 
-                cross_i = mic_i[m][k]*mic_r[n][k] - mic_r[m][k]*mic_i[n][k];
-                R_mat_r[k][m][n] = ALPHA * R_mat_r[k][m][n] + (1.0f - ALPHA) * rho * cross_r;
-                R_mat_i[k][m][n] = ALPHA * R_mat_i[k][m][n] + (1.0f - ALPHA) * rho * cross_i;
-                
-                temp_r[m][n] = R_mat_r[k][m][n];
-                temp_i[m][n] = R_mat_i[k][m][n];
-            }
-            temp_r[m][m] += DL_FACTOR; 
-        }
-
         freq = (float)k * SAMPLE_RATE / FFT_N;
         omega = 2.0f * PI * freq;
         for(m = 0; m < NUM_MICS; m++) {
@@ -448,31 +419,71 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
             a_i[m] = -sinf(phase); 
         }
 
-        invert_7x7_complex(temp_r, temp_i, inv_r, inv_i);
+        // ==========================================
+        // 核心优化 1：频带截断处理 (800Hz - 3500Hz)
+        // ==========================================
+        if (k >= FREQ_BIN_START && k <= FREQ_BIN_END) {
+            
+            // ==========================================
+            // 核心优化 2：权重更新降频
+            // ==========================================
+            if (update_weights) {
+                bin_energy = 0;
+                for(m = 0; m < NUM_MICS; m++) bin_energy += (mic_r[m][k]*mic_r[m][k] + mic_i[m][k]*mic_i[m][k]);
+                rho = NUM_MICS / (bin_energy + 1e-6f); 
 
-        for(m = 0; m < NUM_MICS; m++) {
-            v_r[m] = 0; v_i[m] = 0;
-            for(n = 0; n < NUM_MICS; n++) {
-                v_r[m] += inv_r[m][n]*a_r[n] - inv_i[m][n]*a_i[n];
-                v_i[m] += inv_r[m][n]*a_i[n] + inv_i[m][n]*a_r[n];
+                for(m = 0; m < NUM_MICS; m++) {
+                    for(n = 0; n < NUM_MICS; n++) {
+                        cross_r = mic_r[m][k]*mic_r[n][k] + mic_i[m][k]*mic_i[n][k]; 
+                        cross_i = mic_i[m][k]*mic_r[n][k] - mic_r[m][k]*mic_i[n][k];
+                        R_mat_r[k][m][n] = ALPHA * R_mat_r[k][m][n] + (1.0f - ALPHA) * rho * cross_r;
+                        R_mat_i[k][m][n] = ALPHA * R_mat_i[k][m][n] + (1.0f - ALPHA) * rho * cross_i;
+                        
+                        temp_r[m][n] = R_mat_r[k][m][n];
+                        temp_i[m][n] = R_mat_i[k][m][n];
+                    }
+                    temp_r[m][m] += DL_FACTOR; 
+                }
+
+                invert_7x7_complex(temp_r, temp_i, inv_r, inv_i);
+
+                for(m = 0; m < NUM_MICS; m++) {
+                    v_r[m] = 0; v_i[m] = 0;
+                    for(n = 0; n < NUM_MICS; n++) {
+                        v_r[m] += inv_r[m][n]*a_r[n] - inv_i[m][n]*a_i[n];
+                        v_i[m] += inv_r[m][n]*a_i[n] + inv_i[m][n]*a_r[n];
+                    }
+                }
+
+                denom_r = 0; denom_i = 0;
+                for(m = 0; m < NUM_MICS; m++) {
+                    denom_r += a_r[m]*v_r[m] + a_i[m]*v_i[m];
+                    denom_i += a_r[m]*v_i[m] - a_i[m]*v_r[m];
+                }
+
+                // 计算并静态保存最新权重
+                for(m = 0; m < NUM_MICS; m++) {
+                    w_r_saved[k][m] = (v_r[m]*denom_r + v_i[m]*denom_i) / (denom_r*denom_r + denom_i*denom_i + 1e-12f);
+                    w_i_saved[k][m] = (v_i[m]*denom_r - v_r[m]*denom_i) / (denom_r*denom_r + denom_i*denom_i + 1e-12f);
+                }
             }
-        }
 
-        denom_r = 0; denom_i = 0;
-        for(m = 0; m < NUM_MICS; m++) {
-            denom_r += a_r[m]*v_r[m] + a_i[m]*v_i[m];
-            denom_i += a_r[m]*v_i[m] - a_i[m]*v_r[m];
-        }
+            // 应用 MVDR 权重进行空间滤波 (无论是否更新，都用现存权重)
+            out_val_r = 0; out_val_i = 0;
+            for(m = 0; m < NUM_MICS; m++) {
+                out_val_r += w_r_saved[k][m]*mic_r[m][k] + w_i_saved[k][m]*mic_i[m][k];
+                out_val_i += w_r_saved[k][m]*mic_i[m][k] - w_i_saved[k][m]*mic_r[m][k];
+            }
 
-        for(m = 0; m < NUM_MICS; m++) {
-            w_r[m] = (v_r[m]*denom_r + v_i[m]*denom_i) / (denom_r*denom_r + denom_i*denom_i + 1e-12f);
-            w_i[m] = (v_i[m]*denom_r - v_r[m]*denom_i) / (denom_r*denom_r + denom_i*denom_i + 1e-12f);
-        }
-
-        out_val_r = 0; out_val_i = 0;
-        for(m = 0; m < NUM_MICS; m++) {
-            out_val_r += w_r[m]*mic_r[m][k] + w_i[m]*mic_i[m][k];
-            out_val_i += w_r[m]*mic_i[m][k] - w_i[m]*mic_r[m][k];
+        } else {
+            // ==========================================
+            // 非核心频带：极低算力的标准 DAS 叠加
+            // ==========================================
+            out_val_r = 0; out_val_i = 0;
+            for(m = 0; m < NUM_MICS; m++) {
+                out_val_r += (a_r[m]*mic_r[m][k] + a_i[m]*mic_i[m][k]) / 7.0f;
+                out_val_i += (a_r[m]*mic_i[m][k] - a_i[m]*mic_r[m][k]) / 7.0f;
+            }
         }
         
         out_r[k] = out_val_r; 
@@ -498,20 +509,11 @@ MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_
 
 STATIC mp_obj_t Maix_mic_array_track_doa(void) {
     static float local_mic_data[NUM_MICS][FFT_N];
-    int m, i;
-    float new_angle;
-
+    int m, i; float new_angle;
     if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
-
-    for(m=0; m<NUM_MICS; m++) {
-        for(i=0; i<FFT_N; i++) local_mic_data[m][i] = shared_doa_mic_data[m][i];
-    }
+    for(m=0; m<NUM_MICS; m++) { for(i=0; i<FFT_N; i++) local_mic_data[m][i] = shared_doa_mic_data[m][i]; }
     shared_data_ready = 0; 
-
-    MP_THREAD_GIL_EXIT(); 
-    new_angle = run_doa_pipeline(local_mic_data);
-    MP_THREAD_GIL_ENTER();
-    
+    MP_THREAD_GIL_EXIT(); new_angle = run_doa_pipeline(local_mic_data); MP_THREAD_GIL_ENTER();
     current_target_angle = new_angle;
     return mp_obj_new_float(new_angle);
 }
@@ -519,21 +521,16 @@ MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_track_doa_obj, Maix_mic_array_track_doa
 
 STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0}; 
-    mp_obj_t *items;
-    uint32_t set_color;
-    
+    mp_obj_t *items; uint32_t set_color;
     mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
     for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
     mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
     for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
-    
     set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
     for (index = 0; index < 12; index++) led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
-    
     sysctl_disable_irq(); sk9822_start_frame();
     for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
     sk9822_stop_frame(); sysctl_enable_irq();
-    
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);

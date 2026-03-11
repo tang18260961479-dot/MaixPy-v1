@@ -295,26 +295,12 @@ MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 // ============================================================================
 STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     volatile uint8_t retry = 100;
-    static float mic_raw[NUM_MICS][FFT_N];
-    float target_angle, cos_t, sin_t, mx, my, tau;
-    static int shift_samples[6];
-    static float prev_x = 0.0f, prev_y = 0.0f;
-    static int16_t pcm_out[FFT_N];
-    int i, m, target_idx;
-    mp_obj_t tuple[2];
-
-    // PCF 相关变量
-    float temp_out[FFT_N];
-    float sum_energy = 0.0f;
-    float mic_energy = 0.0f;
-    float energy_i, val, frame_pcf, gain_factor, amplified;
-    static float smoothed_gain = 1.0f;
-
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    for (i = 0; i < FFT_N; i++) {
+    static float mic_raw[NUM_MICS][FFT_N];
+    for (int i = 0; i < FFT_N; i++) {
         mic_raw[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
         mic_raw[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
         mic_raw[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
@@ -325,78 +311,84 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     }
 
     if (shared_data_ready == 0) {
-        for(m=0; m<NUM_MICS; m++) {
-            for(i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_raw[m][i];
+        for(int m=0; m<NUM_MICS; m++) {
+            for(int i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_raw[m][i];
         }
         shared_data_ready = 1; 
     }
 
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    target_angle = current_target_angle;
-    cos_t = cosf(target_angle * DEG2RAD);
-    sin_t = sinf(target_angle * DEG2RAD);
+    float target_angle = current_target_angle;
+    float cos_t = cosf(target_angle * DEG2RAD);
+    float sin_t = sinf(target_angle * DEG2RAD);
     
-    // 计算 6 颗外围麦克风的平移量
-    for (m = 0; m < 6; m++) {
-        mx = 0.04f * cosf(m * 60.0f * DEG2RAD);
-        my = 0.04f * sinf(m * 60.0f * DEG2RAD);
-        tau = (mx * cos_t + my * sin_t) / SOUND_SPEED;
+    static int shift_samples[6];
+    for (int m = 0; m < 6; m++) {
+        float mx = 0.04f * cosf(m * 60.0f * DEG2RAD);
+        float my = 0.04f * sinf(m * 60.0f * DEG2RAD);
+        float tau = (mx * cos_t + my * sin_t) / SOUND_SPEED;
         shift_samples[m] = (int)roundf(tau * SAMPLE_RATE);
     }
 
-    // 1. 时域对齐求和，并同时计算空间相关性能量 (PCF)
-    for (i = 0; i < FFT_N; i++) {
+    static int16_t pcm_out[FFT_N];
+    
+    // 【核心修复 1】：为 6 颗外围麦克风建立独立的 DC-Blocker 历史状态
+    static float dc_x[6] = {0}, dc_y[6] = {0};
+    
+    float temp_out[FFT_N];
+    float sum_energy = 0.0f;
+    float mic_energy = 0.0f;
+    float frame_pcf, gain_factor, amplified;
+    static float smoothed_gain = 1.0f;
+
+    for (int i = 0; i < FFT_N; i++) {
         float sum = 0.0f;
-        energy_i = 0.0f;
+        float energy_i = 0.0f;
         
-        for (m = 0; m < 6; m++) {
-            target_idx = i - shift_samples[m];
-            val = 0.0f;
+        for (int m = 0; m < 6; m++) {
+            int target_idx = i - shift_samples[m];
+            float ac_val = 0.0f;
+            
             if (target_idx >= 0 && target_idx < FFT_N) {
-                val = mic_raw[m][target_idx];
+                float raw_val = mic_raw[m][target_idx];
+                // 【核心修复 2】：在累加之前，强制执行一阶高通滤波剔除直流偏置！
+                ac_val = raw_val - dc_x[m] + 0.995f * dc_y[m];
+                dc_x[m] = raw_val;
+                dc_y[m] = ac_val;
             }
-            sum += val;
-            energy_i += val * val;
+            sum += ac_val;
+            energy_i += (ac_val * ac_val);
         }
         sum /= 6.0f; 
         
-        // 累加整帧的相干能量与非相干能量
+        // 现在能量池里只剩下纯净的声学震荡能量，PCF 测谎仪将恢复极度敏锐！
         sum_energy += (sum * sum);
         mic_energy += (energy_i / 6.0f);
-
-        // 去直流高通滤波
-        float y = sum - prev_x + 0.995f * prev_y;
-        prev_x = sum; prev_y = y;
-        temp_out[i] = y;
+        temp_out[i] = sum; 
     }
 
-    // 2. 计算本帧的相干掩膜 (PCF 核心算法)
-    // 越是来自目标方向的声音，frame_pcf 越接近 1.0；侧面噪音会掉到 0.3 以下
+    // 计算 PCF 掩膜
     frame_pcf = sum_energy / (mic_energy + 1e-6f);
     if (frame_pcf > 1.0f) frame_pcf = 1.0f;
 
-    // 二次幂强化：像手术刀一样切掉非目标区域的声音
-    gain_factor = frame_pcf * frame_pcf;
+    // 【锐化增强】：因为阵列小分辨率低，我们将 PCF 进行 4 次幂衰减，强行挖出深渊零陷！
+    gain_factor = frame_pcf * frame_pcf * frame_pcf * frame_pcf;
 
-    // 帧间平滑，防止音量突变产生“抽吸效应”
-    smoothed_gain = 0.8f * smoothed_gain + 0.2f * gain_factor;
+    smoothed_gain = 0.85f * smoothed_gain + 0.15f * gain_factor;
 
-    // 3. 将 PCF 掩膜应用到最终音频输出上
-    for (i = 0; i < FFT_N; i++) {
-        // 由于 PCF 会大幅削减环境侧面音量，因此基础增益调高至 8.0f 补偿人声
-        amplified = temp_out[i] * 8.0f * smoothed_gain; 
-        
+    for (int i = 0; i < FFT_N; i++) {
+        amplified = temp_out[i] * 5.0f * smoothed_gain; 
         if(amplified > 32767.0f) amplified = 32767.0f;
         if(amplified < -32768.0f) amplified = -32768.0f;
         pcm_out[i] = (int16_t)amplified;
     }
 
+    mp_obj_t tuple[2];
     tuple[0] = mp_obj_new_float(target_angle);
     tuple[1] = mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
     return mp_obj_new_tuple(2, tuple);
 }
-MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
 
 STATIC mp_obj_t Maix_mic_array_track_doa(void) {
     static float local_mic_data[NUM_MICS][FFT_N];

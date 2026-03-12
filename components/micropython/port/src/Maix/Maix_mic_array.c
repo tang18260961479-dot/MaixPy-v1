@@ -102,12 +102,10 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 }
 
 // ============================================================================
-// 第二部分：测向管线 (【内核替换】: 宽带 SRP-PHAT + 卡尔曼)
+// 第二部分：测向管线 (【内核】：宽带 SRP-PHAT + 动态自适应卡尔曼)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    // -------------------------------------------------------------
     // 【C90 严苛规范】：所有变量在最顶端统一声明
-    // -------------------------------------------------------------
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_phat_r[NUM_PAIRS][FFT_N / 2];
@@ -187,10 +185,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     raw_angle -= 180.0f;
 
     // ============================================================================
-    // 4. 【系统锁定】：鲁棒 Alpha-Beta 卡尔曼滤波器 (完全继承，防瞬移)
-    // ============================================================================
-   // ============================================================================
-    // 【升级版】：动态物理时钟 + 自适应鲁棒 Alpha-Beta 滤波器
+    // 4. 【系统锁定】：动态时钟 + 自适应激进卡尔曼滤波器
     // ============================================================================
     {
         static int tracker_initialized = 0;
@@ -198,39 +193,34 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         static float est_velocity = 0.0f;
         static uint32_t last_time_ms = 0;
         
-        // 针对重型算法的激进参数调优：
-        // 提高 ALPHA: 因为帧率低，一旦算出来一帧，就要更信任它，加速靠拢
+        // 激进追踪参数：适应 SRP 等重型算法的低帧率
         const float ALPHA = 0.6f;           
         const float BETA  = 0.05f;          
-        // 放宽 Huber 阈值: 允许在低帧率下发生较大跨度的合理跳跃
-        const float HUBER_THRESH = 40.0f;   
+        const float HUBER_THRESH = 40.0f;   // 放宽异常跳点判定，允许大角度转身
         
         uint32_t current_time_ms = mp_hal_ticks_ms();
         float dt, pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
         if (!tracker_initialized) {
-            est_angle = raw_angle; 
-            est_velocity = 0.0f; 
+            est_angle = raw_angle;
+            est_velocity = 0.0f;
             last_time_ms = current_time_ms;
-            tracker_initialized = 1; 
+            tracker_initialized = 1;
             return est_angle;
         }
 
-        // 【核心修复】：动态获取真实物理耗时，打破时间膨胀！
+        // 动态获取真实物理耗时 (打破慢动作膨胀)
         dt = (current_time_ms - last_time_ms) / 1000.0f;
-        if (dt <= 0.001f) dt = 0.01f; // 防止除零
-        if (dt > 1.0f) dt = 1.0f;     // 防止系统挂起过久导致积分爆炸
+        if (dt <= 0.001f) dt = 0.01f;
+        if (dt > 1.0f) dt = 1.0f; // 防挂起爆炸
         last_time_ms = current_time_ms;
 
-        // 1. 运动学预测
         pred_angle = est_angle + est_velocity * dt;
 
-        // 2. 计算残差并进行环形折叠 (-180 到 180)
         raw_residual = raw_angle - pred_angle;
         while (raw_residual > 180.0f)  raw_residual -= 360.0f;
         while (raw_residual < -180.0f) raw_residual += 360.0f;
 
-        // 3. 放宽限制的 Huber M-估计
         abs_res = fabsf(raw_residual);
         robust_weight = 1.0f;
         if (abs_res > HUBER_THRESH) {
@@ -238,16 +228,15 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
         robust_residual = raw_residual * robust_weight;
 
-        // 4. 状态更新
         est_angle = pred_angle + ALPHA * robust_residual;
         est_velocity = est_velocity + BETA * (robust_residual / dt);
 
-        // 环形规范化
         while (est_angle > 180.0f)  est_angle -= 360.0f;
         while (est_angle < -180.0f) est_angle += 360.0f;
 
         return est_angle;
     }
+}
 
 // ============================================================================
 // 第三部分：核心 API 与 【物理级 FD-PCF 频域束波成型 (绝对锁死)】
@@ -275,7 +264,7 @@ MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
 STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
-// 录音外设：锁定 FD-PCF 零相位掩膜与亚采样级对齐
+// 录音外设：锁定 FD-PCF 零相位掩膜与亚采样级对齐 (完全 C90 规范)
 STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     volatile uint8_t retry = 100;
     static float mic_r_all[NUM_MICS][FFT_N];
@@ -366,7 +355,7 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
         pcf = coh_energy / (incoh_energy + 1e-12f);
         if (pcf > 1.0f) pcf = 1.0f;
 
-        gain = pcf * pcf * pcf;
+        gain = pcf * pcf * pcf; // PCF 3次幂强力深挖零陷
         G_smooth[k] = 0.6f * G_smooth[k] + 0.4f * gain;
 
         out_r[k] = sum_r * G_smooth[k] * 2.5f; 

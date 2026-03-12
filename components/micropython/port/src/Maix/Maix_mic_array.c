@@ -101,42 +101,27 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
-static float calculate_median(float* array, int size) {
-    float temp[NUM_PAIRS]; int i, j; float swap;
-    for(i = 0; i < size; i++) temp[i] = array[i];
-    for (i = 0; i < size - 1; i++) {
-        for (j = 0; j < size - i - 1; j++) {
-            if (temp[j] > temp[j + 1]) {
-                swap = temp[j]; temp[j] = temp[j + 1]; temp[j + 1] = swap;
-            }
-        }
-    }
-    return temp[size / 2];
-}
-
 // ============================================================================
-// 第二部分：时空级联 M-估计 测向管线 
+// 第二部分：测向管线 (【已替换】: 纯 GCC-PHAT + 全空间网格搜索)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
+    // 严格 C90：所有变量必须在函数最顶端声明
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     float Meas_TDOA[NUM_PAIRS];
     float Qual_Score[NUM_PAIRS];
     static float R_real[FFT_N], R_imag[FFT_N];
-    int m, i, u, v, k, p, iter, theta, max_idx, search_range, valid_count;
+    
+    int m, i, u, v, k, p, theta, max_idx, search_range;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float min_cost, ang_coarse, cost, cos_t, sin_t, theo_tdoa, err;
-    float raw_residuals_t[NUM_PAIRS]; 
-    float cos_coarse, sin_coarse, med_res_m, sigma_adaptive_m, sigma_adaptive_t;
-    float Final_W[NUM_PAIRS], res_sq, w_consist;
-    float ang_gn, raw_angle;
-    float sum_WJr, sum_WJJ, cos_gn, sin_gn, r_p, J_p, delta_ang;
+    float min_cost, cost, cos_t, sin_t, theo_tdoa, err, best_ang, raw_angle;
 
     k = 0;
     min_cost = FLT_MAX;
-    ang_coarse = 0.0f;
+    best_ang = 0.0f;
     for(i=0; i<NUM_PAIRS; i++) { Meas_TDOA[i]=0.0f; Qual_Score[i]=0.0f; }
 
+    // 1. 加窗与正向 FFT
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -146,14 +131,20 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
+    // 2. GCC-PHAT 计算到达时间差 (TDOA)
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
-            max_val = 0; max_idx = 0; search_range = 8; delta = 0;
+            max_val = 0; 
+            max_idx = 0; 
+            search_range = 8; 
+            delta = 0;
+
             for (i = 0; i < FFT_N; i++) {
                 cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
                 cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
                 mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
+                R_real[i] = cross_r / mag; 
+                R_imag[i] = cross_i / mag;
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
             
@@ -172,62 +163,37 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
+    // 3. 【替换核心】全空间粗网格搜索 (Grid Search)，取代了之前的 M-估计和 GN 迭代
     for (theta = -180; theta < 180; theta++) {
-        cost = 0.0f; cos_t = cosf(theta * DEG2RAD); sin_t = sinf(theta * DEG2RAD);
+        cost = 0.0f; 
+        cos_t = cosf(theta * DEG2RAD); 
+        sin_t = sinf(theta * DEG2RAD);
         for (p = 0; p < NUM_PAIRS; p++) {
             if (Qual_Score[p] < 1e-3f) continue;
             theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
             err = theo_tdoa - Meas_TDOA[p];
             cost += Qual_Score[p] * pair_conf[p].dist * err * err;
         }
-        if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
+        if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
-    cos_coarse = cosf(ang_coarse * DEG2RAD); sin_coarse = sinf(ang_coarse * DEG2RAD);
-    for (p = 0; p < NUM_PAIRS; p++) {
-        theo_tdoa = (pair_conf[p].dx * cos_coarse + pair_conf[p].dy * sin_coarse) / SOUND_SPEED;
-        raw_residuals_t[p] = fabsf(Meas_TDOA[p] - theo_tdoa);
-    }
-
-    med_res_m = calculate_median(raw_residuals_t, NUM_PAIRS) * SOUND_SPEED;
-    sigma_adaptive_m = med_res_m * 1.5f;
-    if (sigma_adaptive_m < 0.015f) sigma_adaptive_m = 0.015f;
-    if (sigma_adaptive_m > 0.10f) sigma_adaptive_m = 0.10f;
-    sigma_adaptive_t = sigma_adaptive_m / SOUND_SPEED;
-
-    for (p = 0; p < NUM_PAIRS; p++) {
-        res_sq = raw_residuals_t[p] * raw_residuals_t[p];
-        w_consist = expf(-res_sq / (2.0f * sigma_adaptive_t * sigma_adaptive_t));
-        Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
-    }
-
-    ang_gn = ang_coarse;
-    for (iter = 0; iter < 8; iter++) {
-        sum_WJr = 0.0f; sum_WJJ = 0.0f; valid_count = 0;
-        cos_gn = cosf(ang_gn * DEG2RAD); sin_gn = sinf(ang_gn * DEG2RAD);
-        for (p = 0; p < NUM_PAIRS; p++) {
-            if (Final_W[p] < 1e-4f) continue;
-            valid_count++;
-            theo_tdoa = (pair_conf[p].dx * cos_gn + pair_conf[p].dy * sin_gn) / SOUND_SPEED;
-            r_p = theo_tdoa - Meas_TDOA[p];
-            J_p = DEG2RAD * (-pair_conf[p].dx * sin_gn + pair_conf[p].dy * cos_gn) / SOUND_SPEED;
-            sum_WJr += Final_W[p] * J_p * r_p; sum_WJJ += Final_W[p] * J_p * J_p;
-        }
-        if (valid_count < 3) break;
-        delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
-        ang_gn += delta_ang; 
-        if (fabsf(delta_ang) < 1e-3f) break;
-    }
-    
-    raw_angle = fmodf(ang_gn + 180.0f, 360.0f);
+    raw_angle = fmodf(best_ang + 180.0f, 360.0f);
     if (raw_angle < 0) raw_angle += 360.0f;
     raw_angle -= 180.0f;
 
+    // ============================================================================
+    // 4. 【时间层锁定】：卡尔曼平滑防抖 (0.064s 纯物理时间版)
+    // ============================================================================
     {
         static int tracker_initialized = 0;
         static float est_angle = 0.0f;
         static float est_velocity = 0.0f;
-        const float ALPHA = 0.3f, BETA = 0.02f, HUBER_THRESH = 15.0f, dt = 0.064f; 
+        
+        const float ALPHA = 0.3f;           
+        const float BETA  = 0.02f;          
+        const float HUBER_THRESH = 15.0f;   
+        const float dt = 0.064f; 
+        
         float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
         if (!tracker_initialized) {
@@ -246,6 +212,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
         est_angle = pred_angle + ALPHA * robust_residual;
         est_velocity = est_velocity + BETA * (robust_residual / dt);
+
         while (est_angle > 180.0f)  est_angle -= 360.0f;
         while (est_angle < -180.0f) est_angle += 360.0f;
 
@@ -254,7 +221,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 }
 
 // ============================================================================
-// 第三部分：核心 API 与 【物理级 FD-PCF 频域束波成型】
+// 第三部分：核心 API 与 【物理级 FD-PCF 频域束波成型 (绝对锁死)】
 // ============================================================================
 static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
 
@@ -280,7 +247,7 @@ STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
 // ============================================================================
-// 【革命性升级】：FD-PCF 频域零相位掩膜 (彻底击碎小阵列物理极限)
+// 录音外设：锁定 FD-PCF 零相位掩膜与亚采样级对齐
 // ============================================================================
 STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     volatile uint8_t retry = 100;
@@ -314,7 +281,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
         mic_r_all[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); 
     }
 
-    // 分发全量数据给后台雷达兵
     if (shared_data_ready == 0) {
         for(m=0; m<NUM_MICS; m++) {
             for(i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_r_all[m][i];
@@ -328,7 +294,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     cos_t = cosf(target_angle * DEG2RAD);
     sin_t = sinf(target_angle * DEG2RAD);
 
-    // 仅针对外围 6 颗执行独立 FFT，隔离中心底噪
     for(m=0; m<6; m++) {
         for(i=0; i<FFT_N; i++) {
             mic_r[m][i] = mic_r_all[m][i];
@@ -340,7 +305,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     out_r[0] = 0; out_i[0] = 0;
     out_r[FFT_N/2] = 0; out_i[FFT_N/2] = 0;
 
-    // 核心算法：频域亚采样对齐 + 频点独立空间掩膜
     for (k = 1; k < FFT_N/2; k++) {
         freq = (float)k * SAMPLE_RATE / FFT_N;
         omega = 2.0f * PI * freq;
@@ -352,14 +316,12 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
             tau = (mx[m]*cos_t + my[m]*sin_t) / SOUND_SPEED;
             phase = omega * tau;
             
-            // 计算频域相移因子 e^{+j*omega*tau}
             a_r = cosf(phase);
             a_i = sinf(phase);
 
             Xr = mic_r[m][k];
             Xi = mic_i[m][k];
             
-            // 精确的频域对齐 X_aligned = X * a
             Xa_r = Xr * a_r - Xi * a_i;
             Xa_i = Xr * a_i + Xi * a_r;
 
@@ -374,17 +336,12 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
 
         coh_energy = sum_r*sum_r + sum_i*sum_i;
         
-        // 算出当前频点 (Bin) 的相干性，彻底无视低频陷阱
         pcf = coh_energy / (incoh_energy + 1e-12f);
         if (pcf > 1.0f) pcf = 1.0f;
 
-        // 3次幂强力深挖零陷
         gain = pcf * pcf * pcf;
-        
-        // 时间平滑，消除断层与 "鸟鸣声 (Musical Noise)"
         G_smooth[k] = 0.6f * G_smooth[k] + 0.4f * gain;
 
-        // 【零相位掩膜】：只改振幅，不改变混合后的相位，音质纯净！
         out_r[k] = sum_r * G_smooth[k] * 2.5f; 
         out_i[k] = sum_i * G_smooth[k] * 2.5f;
         out_r[FFT_N - k] = out_r[k];
@@ -394,7 +351,6 @@ STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     fft_radix2(out_r, out_i, FFT_N, 1);
 
     for (i = 0; i < FFT_N; i++) {
-        // DC-Blocker 终极去直流保护
         y = out_r[i] - prev_x + 0.995f * prev_y;
         prev_x = out_r[i];
         prev_y = y;

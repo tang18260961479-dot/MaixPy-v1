@@ -189,31 +189,48 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     // ============================================================================
     // 4. 【系统锁定】：鲁棒 Alpha-Beta 卡尔曼滤波器 (完全继承，防瞬移)
     // ============================================================================
+   // ============================================================================
+    // 【升级版】：动态物理时钟 + 自适应鲁棒 Alpha-Beta 滤波器
+    // ============================================================================
     {
         static int tracker_initialized = 0;
         static float est_angle = 0.0f;
         static float est_velocity = 0.0f;
+        static uint32_t last_time_ms = 0;
         
-        const float ALPHA = 0.3f;           
-        const float BETA  = 0.02f;          
-        const float HUBER_THRESH = 15.0f;   
-        const float dt = 0.064f; 
+        // 针对重型算法的激进参数调优：
+        // 提高 ALPHA: 因为帧率低，一旦算出来一帧，就要更信任它，加速靠拢
+        const float ALPHA = 0.6f;           
+        const float BETA  = 0.05f;          
+        // 放宽 Huber 阈值: 允许在低帧率下发生较大跨度的合理跳跃
+        const float HUBER_THRESH = 40.0f;   
         
-        float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
+        uint32_t current_time_ms = mp_hal_ticks_ms();
+        float dt, pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
         if (!tracker_initialized) {
-            est_angle = raw_angle;
-            est_velocity = 0.0f;
-            tracker_initialized = 1;
+            est_angle = raw_angle; 
+            est_velocity = 0.0f; 
+            last_time_ms = current_time_ms;
+            tracker_initialized = 1; 
             return est_angle;
         }
 
+        // 【核心修复】：动态获取真实物理耗时，打破时间膨胀！
+        dt = (current_time_ms - last_time_ms) / 1000.0f;
+        if (dt <= 0.001f) dt = 0.01f; // 防止除零
+        if (dt > 1.0f) dt = 1.0f;     // 防止系统挂起过久导致积分爆炸
+        last_time_ms = current_time_ms;
+
+        // 1. 运动学预测
         pred_angle = est_angle + est_velocity * dt;
 
+        // 2. 计算残差并进行环形折叠 (-180 到 180)
         raw_residual = raw_angle - pred_angle;
         while (raw_residual > 180.0f)  raw_residual -= 360.0f;
         while (raw_residual < -180.0f) raw_residual += 360.0f;
 
+        // 3. 放宽限制的 Huber M-估计
         abs_res = fabsf(raw_residual);
         robust_weight = 1.0f;
         if (abs_res > HUBER_THRESH) {
@@ -221,15 +238,16 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
         robust_residual = raw_residual * robust_weight;
 
+        // 4. 状态更新
         est_angle = pred_angle + ALPHA * robust_residual;
         est_velocity = est_velocity + BETA * (robust_residual / dt);
 
+        // 环形规范化
         while (est_angle > 180.0f)  est_angle -= 360.0f;
         while (est_angle < -180.0f) est_angle += 360.0f;
 
         return est_angle;
     }
-}
 
 // ============================================================================
 // 第三部分：核心 API 与 【物理级 FD-PCF 频域束波成型 (绝对锁死)】

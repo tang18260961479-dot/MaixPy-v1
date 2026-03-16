@@ -173,7 +173,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     }
     frame_energy /= FFT_N;
     
-    vad_energy_threshold = 5.0f; // 可根据实验测得的背景 SNR 微调
+    vad_energy_threshold = 10.0f; // 可根据实验测得的背景 SNR 微调
     if (frame_energy < vad_energy_threshold && s_doa_initialized) {
         return s_last_valid_angle; 
     }
@@ -302,7 +302,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     if (diff > 180.0f) diff -= 360.0f;
     if (diff < -180.0f) diff += 360.0f;
 
-    alpha = 0.3f;
+    alpha = 0.2f;
     s_last_valid_angle += alpha * diff;
 
     if (s_last_valid_angle > 180.0f) s_last_valid_angle -= 360.0f;

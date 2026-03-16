@@ -142,46 +142,43 @@ static float calculate_median(float* array, int size) {
     return temp[size / 2];
 }
 
-// 4. M-估计核心测向流水线 (修复了严格的 C89/C90 变量声明规范)
+// 4. M-估计核心测向流水线 (原汁原味还原 MAD 核心，仅增加首尾状态控制)
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    // 静态内存分配区
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_real[FFT_N], R_imag[FFT_N];
     static float s_last_valid_angle = 0.0f;
     static int s_doa_initialized = 0;
     
-    // 局部变量统一在此顶部声明，避免编译报错
+    // 严格 C89 变量声明
     int m, i, u, v, k, theta, p, iter;
-    int start_bin, end_bin, search_range, max_idx, valid_count;
-    
-    float window, frame_energy, vad_energy_threshold, df, theoretical_max;
-    float cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples, normalized_max;
-    
+    int search_range, max_idx, valid_count;
+    float window, frame_energy, vad_energy_threshold;
+    float cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
+    float min_cost, ang_coarse, cos_t, sin_t, cost, theo_tdoa, err;
+    float cos_coarse, sin_coarse, med_res_m, sigma_adaptive_m, sigma_adaptive_t;
+    float res_sq, w_consist;
+    float ang_gn, sum_WJr, sum_WJJ, cos_gn, sin_gn, r_p, J_p, delta_ang;
+    float current_ang, diff, alpha;
+
     float Meas_TDOA[NUM_PAIRS] = {0};
     float Qual_Score[NUM_PAIRS] = {0};
-    
-    float min_cost, ang_coarse, cos_t, sin_t, cost, theo_tdoa, err;
-    float raw_residuals_t[NUM_PAIRS];
-    float cos_coarse, sin_coarse, med_res_m, sigma_adaptive_m, sigma_adaptive_t;
-    float Final_W[NUM_PAIRS];
-    float res_sq, w_consist;
-    
-    float ang_gn, sum_WJr, sum_WJJ, cos_gn, sin_gn, r_p, J_p, delta_ang, current_ang, diff, alpha;
+    float raw_residuals_t[NUM_PAIRS] = {0};
+    float Final_W[NUM_PAIRS] = {0};
 
-    // --- 改进 1：能量阈值 (VAD) ---
+    // --- 增量 1：VAD 拦截混响尾音 ---
     frame_energy = 0.0f;
     for (i = 0; i < FFT_N; i++) {
         frame_energy += mic_data[6][i] * mic_data[6][i];
     }
     frame_energy /= FFT_N;
     
-    vad_energy_threshold = 5.0f; 
+    vad_energy_threshold = 5.0f; // 可根据实验测得的背景 SNR 微调
     if (frame_energy < vad_energy_threshold && s_doa_initialized) {
         return s_last_valid_angle; 
     }
 
-    // 加窗与正向 FFT
+    // 绝对保留你的原版加窗与 FFT
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -191,28 +188,16 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // --- 改进 2：语音频带限制 (Speech Bandpass) ---
-    df = SAMPLE_RATE / FFT_N;
-    start_bin = (int)ceilf(300.0f / df);  
-    end_bin = (int)floorf(4000.0f / df);  
-    theoretical_max = (float)((end_bin - start_bin + 1) * 2) / FFT_N;
-
+    // 绝对保留你的原版 1024 点全频带 GCC-PHAT 计算 (耗时完全一致)
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
-            memset(R_real, 0, sizeof(R_real));
-            memset(R_imag, 0, sizeof(R_imag));
-
-            for (i = start_bin; i <= end_bin; i++) {
+            for (i = 0; i < FFT_N; i++) {
                 cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
                 cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
                 mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
                 R_real[i] = cross_r / mag;
                 R_imag[i] = cross_i / mag;
-                
-                // 确保共轭对称性以进行实数 IFFT
-                R_real[FFT_N - i] = R_real[i];
-                R_imag[FFT_N - i] = -R_imag[i];
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
 
@@ -238,13 +223,13 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
             Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
             
-            normalized_max = max_val / (theoretical_max + 1e-9f);
-            Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (normalized_max - 0.25f)));
+            // 绝对保留你的原版 MAD 评分阈值机制
+            Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
             k++;
         }
     }
 
-    // 粗网格搜索
+    // 绝对保留你的原版粗网格搜索
     min_cost = FLT_MAX;
     ang_coarse = 0.0f;
     for (theta = -180; theta < 180; theta++) {
@@ -260,7 +245,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
     }
 
-    // 自适应权重
+    // 绝对保留你的原版自适应权重
     cos_coarse = cosf(ang_coarse * DEG2RAD);
     sin_coarse = sinf(ang_coarse * DEG2RAD);
     for (p = 0; p < NUM_PAIRS; p++) {
@@ -279,7 +264,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
     }
 
-    // Gauss-Newton 微调
+    // 绝对保留你的原版 Gauss-Newton 微调
     ang_gn = ang_coarse;
     for (iter = 0; iter < 8; iter++) {
         sum_WJr = 0.0f;
@@ -306,7 +291,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     if (ang_gn < 0) ang_gn += 360.0f;
     current_ang = ang_gn - 180.0f;
 
-    // --- 改进 3：角度时域平滑 (Alpha Filter) ---
+    // --- 增量 2：平滑桥接语音卡顿 ---
     if (!s_doa_initialized) {
         s_last_valid_angle = current_ang;
         s_doa_initialized = 1;

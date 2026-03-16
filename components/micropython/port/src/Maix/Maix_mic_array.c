@@ -111,6 +111,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
 // 第二部分：测向管线 (SRP-PHAT + 极度敏捷版卡尔曼)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
+    // 【C90 严苛规范】：所有变量在最顶端统一声明
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_phat_r[NUM_PAIRS][FFT_N / 2];
@@ -122,6 +123,13 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float cross_r, cross_i, mag;
     float max_srp_energy, best_ang, raw_angle;
     float e_sum, cos_t, sin_t, theo_tdoa, freq, omega, phase, steer_r, steer_i;
+    
+    // 卡尔曼参数与临时变量
+    const float ALPHA = 0.85f;          
+    const float BETA  = 0.1f;           
+    const float HUBER_THRESH = 120.0f;  
+    uint32_t current_time_ms;
+    float dt, pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
@@ -182,49 +190,41 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     raw_angle -= 180.0f;
 
     // ============================================================================
-    // 4. 【系统锁定】：超敏捷卡尔曼滤波器 (专为重计算量 SRP 优化)
+    // 4. 【系统锁定】：超敏捷卡尔曼滤波器 (动态时钟消除误差)
     // ============================================================================
-    {
-        // 核心修改点：
-        const float ALPHA = 0.85f;          // 极高信任度：几乎直接采用 SRP 的当前结果，降低拖拽感
-        const float BETA  = 0.1f;           // 加快速度收敛
-        const float HUBER_THRESH = 120.0f;  // 阈值极度放宽至 120 度：允许瞬间大角度回头，不再当成噪声抑制！
-        
-        uint32_t current_time_ms = mp_hal_ticks_ms();
-        float dt, pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
+    current_time_ms = mp_hal_ticks_ms();
 
-        if (!kf_initialized) {
-            kf_est_angle = raw_angle;
-            kf_est_velocity = 0.0f;
-            kf_last_time_ms = current_time_ms;
-            kf_initialized = 1;
-            return kf_est_angle;
-        }
-
-        dt = (current_time_ms - kf_last_time_ms) / 1000.0f;
-        if (dt <= 0.001f) dt = 0.01f;
-        if (dt > 1.0f) dt = 1.0f; 
+    if (!kf_initialized) {
+        kf_est_angle = raw_angle;
+        kf_est_velocity = 0.0f;
         kf_last_time_ms = current_time_ms;
-
-        pred_angle = kf_est_angle + kf_est_velocity * dt;
-
-        raw_residual = raw_angle - pred_angle;
-        while (raw_residual > 180.0f)  raw_residual -= 360.0f;
-        while (raw_residual < -180.0f) raw_residual += 360.0f;
-
-        abs_res = fabsf(raw_residual);
-        robust_weight = 1.0f;
-        if (abs_res > HUBER_THRESH) robust_weight = HUBER_THRESH / abs_res;
-        robust_residual = raw_residual * robust_weight;
-
-        kf_est_angle = pred_angle + ALPHA * robust_residual;
-        kf_est_velocity = kf_est_velocity + BETA * (robust_residual / dt);
-
-        while (kf_est_angle > 180.0f)  kf_est_angle -= 360.0f;
-        while (kf_est_angle < -180.0f) kf_est_angle += 360.0f;
-
+        kf_initialized = 1;
         return kf_est_angle;
     }
+
+    dt = (current_time_ms - kf_last_time_ms) / 1000.0f;
+    if (dt <= 0.001f) dt = 0.01f;
+    if (dt > 1.0f) dt = 1.0f; 
+    kf_last_time_ms = current_time_ms;
+
+    pred_angle = kf_est_angle + kf_est_velocity * dt;
+
+    raw_residual = raw_angle - pred_angle;
+    while (raw_residual > 180.0f)  raw_residual -= 360.0f;
+    while (raw_residual < -180.0f) raw_residual += 360.0f;
+
+    abs_res = fabsf(raw_residual);
+    robust_weight = 1.0f;
+    if (abs_res > HUBER_THRESH) robust_weight = HUBER_THRESH / abs_res;
+    robust_residual = raw_residual * robust_weight;
+
+    kf_est_angle = pred_angle + ALPHA * robust_residual;
+    kf_est_velocity = kf_est_velocity + BETA * (robust_residual / dt);
+
+    while (kf_est_angle > 180.0f)  kf_est_angle -= 360.0f;
+    while (kf_est_angle < -180.0f) kf_est_angle += 360.0f;
+
+    return kf_est_angle;
 }
 
 // ============================================================================
@@ -263,84 +263,206 @@ STATIC mp_obj_t Maix_mic_array_deinit(void) {
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
+// 兼容旧程序的接口 (报错的元凶已修复)
 STATIC mp_obj_t Maix_mic_array_get_map(void) {
     mp_raise_ValueError("Thermal map is disabled. Using high-precision DOA instead.");
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_map_obj, Maix_mic_array_get_map);
 
-STATIC mp_obj_t Maix_mic_array_get_dir(void)
-{
+// 兼容单次直接获取角度的接口 (完全解决 undeclared 错误)
+STATIC mp_obj_t Maix_mic_array_get_dir(void) {
     volatile uint8_t retry = 100;
-    while(rx_flag == 0) {
-        retry--;
-        msleep(1);
-        if(retry == 0) break;
-    }
-    
-    if(rx_flag == 0 && retry == 0) {
-        mp_raise_OSError(MP_ETIMEDOUT);
-        return mp_const_false;
-    }
+    static float mic_raw_local[NUM_MICS][FFT_N];
+    int i;
+    float final_angle;
+
+    while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
+    if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    for (int i = 0; i < FFT_N; i++) {
-        mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
-        mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
-        mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
-        mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
-        mic_raw_float[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
-        mic_raw_float[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
-        mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
+    for (i = 0; i < FFT_N; i++) {
+        mic_raw_local[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
+        mic_raw_local[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
+        mic_raw_local[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
+        mic_raw_local[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
+        mic_raw_local[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
+        mic_raw_local[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
+        mic_raw_local[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
     }
 
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    float final_angle = run_doa_pipeline(mic_raw_float);
+    final_angle = run_doa_pipeline(mic_raw_local);
+    current_target_angle = final_angle;
 
     return mp_obj_new_float(final_angle);
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_dir_obj, Maix_mic_array_get_dir);
 
-STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
-{
-    int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0};
-    mp_obj_t *items;
+// 录音外设：锁定 FD-PCF 零相位掩膜与亚采样级对齐
+STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
+    volatile uint8_t retry = 100;
+    static float mic_r_all[NUM_MICS][FFT_N];
+    float target_angle, cos_t, sin_t;
+    float mx[6] = {0.04f*cosf(0), 0.04f*cosf(60*DEG2RAD), 0.04f*cosf(120*DEG2RAD), 0.04f*cosf(180*DEG2RAD), 0.04f*cosf(240*DEG2RAD), 0.04f*cosf(300*DEG2RAD)};
+    float my[6] = {0.04f*sinf(0), 0.04f*sinf(60*DEG2RAD), 0.04f*sinf(120*DEG2RAD), 0.04f*sinf(180*DEG2RAD), 0.04f*sinf(240*DEG2RAD), 0.04f*sinf(300*DEG2RAD)};
     
-    mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
-    for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
+    static float mic_r[6][FFT_N];
+    static float mic_i[6][FFT_N];
+    static float out_r[FFT_N], out_i[FFT_N];
+    static float G_smooth[FFT_N/2 + 1] = {0};
+    
+    static int16_t pcm_out[FFT_N];
+    static float prev_x = 0.0f, prev_y = 0.0f;
+    int i, m, k;
+    float freq, omega, sum_r, sum_i, incoh_energy, tau, phase, a_r, a_i, Xr, Xi, Xa_r, Xa_i, coh_energy, pcf, gain, y, amplified;
+    mp_obj_t tuple[2];
 
-    mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
-    for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
+    while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
+    if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
+    rx_flag = 0;
 
-    uint32_t set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
-
-    for (index = 0; index < 12; index++) {
-        led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
+    for (i = 0; i < FFT_N; i++) {
+        mic_r_all[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
+        mic_r_all[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
+        mic_r_all[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
+        mic_r_all[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
+        mic_r_all[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
+        mic_r_all[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
+        mic_r_all[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); 
     }
 
-    sysctl_disable_irq();
-    sk9822_start_frame();
-    for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
-    sk9822_stop_frame();
-    sysctl_enable_irq();
+    if (shared_data_ready == 0) {
+        for(m=0; m<NUM_MICS; m++) {
+            for(i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_r_all[m][i];
+        }
+        shared_data_ready = 1; 
+    }
 
+    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
+
+    target_angle = current_target_angle;
+    cos_t = cosf(target_angle * DEG2RAD);
+    sin_t = sinf(target_angle * DEG2RAD);
+
+    for(m=0; m<6; m++) {
+        for(i=0; i<FFT_N; i++) {
+            mic_r[m][i] = mic_r_all[m][i];
+            mic_i[m][i] = 0.0f;
+        }
+        fft_radix2(mic_r[m], mic_i[m], FFT_N, 0);
+    }
+
+    out_r[0] = 0; out_i[0] = 0;
+    out_r[FFT_N/2] = 0; out_i[FFT_N/2] = 0;
+
+    for (k = 1; k < FFT_N/2; k++) {
+        freq = (float)k * SAMPLE_RATE / FFT_N;
+        omega = 2.0f * PI * freq;
+
+        sum_r = 0.0f; sum_i = 0.0f;
+        incoh_energy = 0.0f;
+
+        for (m = 0; m < 6; m++) {
+            tau = (mx[m]*cos_t + my[m]*sin_t) / SOUND_SPEED;
+            phase = omega * tau;
+            
+            a_r = cosf(phase);
+            a_i = sinf(phase);
+
+            Xr = mic_r[m][k];
+            Xi = mic_i[m][k];
+            
+            Xa_r = Xr * a_r - Xi * a_i;
+            Xa_i = Xr * a_i + Xi * a_r;
+
+            sum_r += Xa_r;
+            sum_i += Xa_i;
+            incoh_energy += (Xr*Xr + Xi*Xi);
+        }
+        
+        sum_r /= 6.0f;
+        sum_i /= 6.0f;
+        incoh_energy /= 6.0f;
+
+        coh_energy = sum_r*sum_r + sum_i*sum_i;
+        
+        pcf = coh_energy / (incoh_energy + 1e-12f);
+        if (pcf > 1.0f) pcf = 1.0f;
+
+        gain = pcf * pcf * pcf;
+        G_smooth[k] = 0.6f * G_smooth[k] + 0.4f * gain;
+
+        out_r[k] = sum_r * G_smooth[k] * 2.5f; 
+        out_i[k] = sum_i * G_smooth[k] * 2.5f;
+        out_r[FFT_N - k] = out_r[k];
+        out_i[FFT_N - k] = -out_i[k];
+    }
+
+    fft_radix2(out_r, out_i, FFT_N, 1);
+
+    for (i = 0; i < FFT_N; i++) {
+        y = out_r[i] - prev_x + 0.995f * prev_y;
+        prev_x = out_r[i];
+        prev_y = y;
+
+        amplified = y * 1.5f; 
+        if(amplified > 32767.0f) amplified = 32767.0f;
+        if(amplified < -32768.0f) amplified = -32768.0f;
+        pcm_out[i] = (int16_t)amplified;
+    }
+
+    tuple[0] = mp_obj_new_float(target_angle);
+    tuple[1] = mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
+    return mp_obj_new_tuple(2, tuple);
+}
+MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
+
+STATIC mp_obj_t Maix_mic_array_track_doa(void) {
+    static float local_mic_data[NUM_MICS][FFT_N];
+    int m, i; float new_angle;
+
+    if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
+    for(m=0; m<NUM_MICS; m++) { for(i=0; i<FFT_N; i++) local_mic_data[m][i] = shared_doa_mic_data[m][i]; }
+    shared_data_ready = 0; 
+
+    MP_THREAD_GIL_EXIT(); new_angle = run_doa_pipeline(local_mic_data); MP_THREAD_GIL_ENTER();
+    
+    current_target_angle = new_angle;
+    return mp_obj_new_float(new_angle);
+}
+MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_track_doa_obj, Maix_mic_array_track_doa);
+
+STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0}; mp_obj_t *items; uint32_t set_color;
+    mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
+    for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
+    mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
+    for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
+    set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
+    for (index = 0; index < 12; index++) led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
+    sysctl_disable_irq(); sk9822_start_frame();
+    for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
+    sk9822_stop_frame(); sysctl_enable_irq();
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);
 
+// ============================================================================
+// 注册映射字典 (包含所有历史 Python 接口，绝不会丢失)
+// ============================================================================
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_beam_audio), MP_ROM_PTR(&Maix_mic_array_get_beam_audio_obj) },
+    { MP_ROM_QSTR(MP_QSTR_track_doa), MP_ROM_PTR(&Maix_mic_array_track_doa_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
-    { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_map), MP_ROM_PTR(&Maix_mic_array_get_map_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
 };
-
 STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
 
 const mp_obj_type_t Maix_mic_array_type = {
-    { &mp_type_type },
-    .name = MP_QSTR_MIC_ARRAY,
-    .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict,
+    { &mp_type_type }, .name = MP_QSTR_MIC_ARRAY, .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict,
 };

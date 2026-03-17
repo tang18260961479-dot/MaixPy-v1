@@ -49,13 +49,14 @@ typedef struct {
 } MicPairConf;
 
 MicPairConf pair_conf[NUM_PAIRS];
+float D_max = 0.08f; // 阵列最大物理孔径 (2.3节引入的归一化基准)
 
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 float mic_raw_float[NUM_MICS][FFT_N];
 
 // ============================================================================
-// 第二部分：纯 C 语言硬核数学与信号处理管线
+// 第二部分：纯 C 语言硬核数学与信号处理管线 (严格对齐论文草稿7-第二章)
 // ============================================================================
 
 static void init_array_geometry(void) {
@@ -72,6 +73,7 @@ static void init_array_geometry(void) {
     mic_pos_2d[6][1] = 0.0f;
 
     k = 0;
+    float max_d = 0.0f;
     for (i = 0; i < NUM_MICS; i++) {
         for (j = i + 1; j < NUM_MICS; j++) {
             pair_conf[k].u = i; 
@@ -79,9 +81,11 @@ static void init_array_geometry(void) {
             pair_conf[k].dx = mic_pos_2d[j][0] - mic_pos_2d[i][0];
             pair_conf[k].dy = mic_pos_2d[j][1] - mic_pos_2d[i][1];
             pair_conf[k].dist = sqrtf(pair_conf[k].dx * pair_conf[k].dx + pair_conf[k].dy * pair_conf[k].dy);
+            if (pair_conf[k].dist > max_d) max_d = pair_conf[k].dist;
             k++;
         }
     }
+    D_max = max_d; // 自动推导最大孔径，通常为 0.08m
 }
 
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
@@ -139,10 +143,10 @@ static float calculate_median(float* array, int size) {
             }
         }
     }
-    return temp[size / 2];
+    return temp[size / 2]; // 返回中位数 (MAD)
 }
 
-// 4. M-估计核心测向流水线
+// 论文 2.1-2.4 节核心算法管线
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
@@ -150,26 +154,24 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float s_last_valid_angle = 0.0f;
     static int s_doa_initialized = 0;
     
-    // 严格 C89 变量声明
-    int m, i, u, v, k, theta, p, iter;
+    int m, i, u, v, k, theta, iter;
     int search_range, max_idx, valid_count;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
     float min_cost, ang_coarse, cos_t, sin_t, cost, theo_tdoa, err;
-    float cos_coarse, sin_coarse, med_res_m, sigma_adaptive_m, sigma_adaptive_t;
-    float res_sq, w_consist;
-    float ang_gn, sum_WJr, sum_WJJ, cos_gn, sin_gn, r_p, J_p, delta_ang;
+    
+    // 论文数学符号对应的局部变量
+    float Q_k[NUM_PAIRS] = {0};         // 2.2 质量得分
+    float tau_meas[NUM_PAIRS] = {0};    // 2.1 测量 TDOA
+    float r_k[NUM_PAIRS] = {0};         // 2.3 物理空间残差
+    float W_k[NUM_PAIRS] = {0};         // 2.3 综合寻优权重
+    float MAD, sigma_adapt, C_score;    // 2.3 自适应尺度参数与防线置信度
+    float J_k, H, G;                    // 2.4 Jacobian, Hessian, Gradient
     float current_ang;
     
-    // 论文“最后一道防线”相关变量
-    float total_weight, normalized_confidence;
-    float CONFIDENCE_THRESHOLD = 0.15f; // 安全下限阈值，可调
+    // 论文防线阈值设定
+    float SAFE_LOWER_BOUND = 0.15f; 
 
-    float Meas_TDOA[NUM_PAIRS] = {0};
-    float Qual_Score[NUM_PAIRS] = {0};
-    float raw_residuals_t[NUM_PAIRS] = {0};
-    float Final_W[NUM_PAIRS] = {0};
-
-    // 加窗与正向 FFT
+    // 1. 特征提取 (加窗与正向 FFT)
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -179,7 +181,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 1024 点 GCC-PHAT 计算
+    // 2. 论文 2.1 节: GCC-PHAT 与 Sigmoid 质量得分提取
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
@@ -212,94 +214,115 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             }
             
             tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
-            Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
+            tau_meas[k] = tau_samples / SAMPLE_RATE; // 提取实际测量 TDOA
             
-            // 严格执行你的原始论文 Sigmoid 评分
-            Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
+            // 式(3): Q_k = 1 / (1 + exp(-beta * (cc_peak - gamma)))
+            Q_k[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
             k++;
         }
     }
 
-    // 粗网格搜索
+    // 3. 论文 2.2 节: 质量与几何感知的空间粗搜
     min_cost = FLT_MAX;
     ang_coarse = 0.0f;
-    for (theta = -180; theta < 180; theta++) {
+    for (theta = -180; theta < 180; theta += 1) { // 步长可根据需要在 1~5 调整
         cost = 0.0f;
         cos_t = cosf(theta * DEG2RAD);
         sin_t = sinf(theta * DEG2RAD);
-        for (p = 0; p < NUM_PAIRS; p++) {
-            if (Qual_Score[p] < 1e-3f) continue;
-            theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
-            err = theo_tdoa - Meas_TDOA[p];
-            cost += Qual_Score[p] * pair_conf[p].dist * err * err;
+        for (k = 0; k < NUM_PAIRS; k++) {
+            if (Q_k[k] < 1e-3f) continue;
+            // 式(2): tau_theo
+            theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+            err = theo_tdoa - tau_meas[k];
+            // 式(4): J_coarse = Sum(Q_k * d_k * err^2)
+            cost += Q_k[k] * pair_conf[k].dist * err * err;
         }
         if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
     }
 
-    // 自适应尺度参数计算 (自适应 sigma_adapt)
-    cos_coarse = cosf(ang_coarse * DEG2RAD);
-    sin_coarse = sinf(ang_coarse * DEG2RAD);
-    for (p = 0; p < NUM_PAIRS; p++) {
-        theo_tdoa = (pair_conf[p].dx * cos_coarse + pair_conf[p].dy * sin_coarse) / SOUND_SPEED;
-        raw_residuals_t[p] = fabsf(Meas_TDOA[p] - theo_tdoa);
-    }
-    med_res_m = calculate_median(raw_residuals_t, NUM_PAIRS) * SOUND_SPEED;
-    sigma_adaptive_m = med_res_m * 1.5f;
-    if (sigma_adaptive_m < 0.015f) sigma_adaptive_m = 0.015f;
-    if (sigma_adaptive_m > 0.10f) sigma_adaptive_m = 0.10f;
-    sigma_adaptive_t = sigma_adaptive_m / SOUND_SPEED;
-
-    // 计算最终一致性权重 W_p
-    for (p = 0; p < NUM_PAIRS; p++) {
-        res_sq = raw_residuals_t[p] * raw_residuals_t[p];
-        w_consist = expf(-res_sq / (2.0f * sigma_adaptive_t * sigma_adaptive_t));
-        Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
-    }
-
-    // =====================================================================
-    // 论文 3.3 节：抵抗野值雪崩的“最后一道防线”
-    // 计算有效麦克风对的归一化权重之和
-    // =====================================================================
-    total_weight = 0.0f;
-    for (p = 0; p < NUM_PAIRS; p++) {
-        total_weight += Final_W[p];
-    }
-    normalized_confidence = total_weight / NUM_PAIRS;
-
-    // 若置信度低于预设下限，标记为不可靠，直接拦截，拒绝输出乱跳的角度
-    if (normalized_confidence < CONFIDENCE_THRESHOLD && s_doa_initialized) {
-        return s_last_valid_angle; 
-    }
-
-    // Gauss-Newton 微调 (只在置信度达标时执行，节省算力)
-    ang_gn = ang_coarse;
-    for (iter = 0; iter < 8; iter++) {
-        sum_WJr = 0.0f;
-        sum_WJJ = 0.0f;
-        valid_count = 0;
-        cos_gn = cosf(ang_gn * DEG2RAD);
-        sin_gn = sinf(ang_gn * DEG2RAD);
-        for (p = 0; p < NUM_PAIRS; p++) {
-            if (Final_W[p] < 1e-4f) continue;
-            valid_count++;
-            theo_tdoa = (pair_conf[p].dx * cos_gn + pair_conf[p].dy * sin_gn) / SOUND_SPEED;
-            r_p = theo_tdoa - Meas_TDOA[p];
-            J_p = DEG2RAD * (-pair_conf[p].dx * sin_gn + pair_conf[p].dy * cos_gn) / SOUND_SPEED;
-            sum_WJr += Final_W[p] * J_p * r_p;
-            sum_WJJ += Final_W[p] * J_p * J_p;
-        }
-        if (valid_count < 3) break;
-        delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
-        ang_gn += delta_ang;
-        if (fabsf(delta_ang) < 1e-3f) break;
+    // 4. 论文 2.3 节: 基于 MAD 理论的自适应 M-估计机制
+    cos_t = cosf(ang_coarse * DEG2RAD);
+    sin_t = sinf(ang_coarse * DEG2RAD);
+    for (k = 0; k < NUM_PAIRS; k++) {
+        theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+        // 式(7): 统一映射至物理空间残差 r_k (米)
+        r_k[k] = SOUND_SPEED * fabsf(tau_meas[k] - theo_tdoa); 
     }
     
-    // 角度规约
-    ang_gn = fmodf(ang_gn + 180.0f, 360.0f);
-    if (ang_gn < 0) ang_gn += 360.0f;
-    current_ang = ang_gn - 180.0f;
+    // 提取空间残差的中位数
+    MAD = calculate_median(r_k, NUM_PAIRS);
+    
+    // 式(10): 自适应尺度参数 sigma_adapt = 1.5 * MAD
+    sigma_adapt = MAD * 1.5f;
+    
+    // 物理孔径安全边界约束 [0.015m, 0.10m]
+    if (sigma_adapt < 0.015f) sigma_adapt = 0.015f;
+    if (sigma_adapt > 0.10f) sigma_adapt = 0.10f;
 
-    // 更新静态历史角度，供无声期拦截使用
+    // 式(11): 构建综合寻优权重 W_k
+    C_score = 0.0f;
+    for (k = 0; k < NUM_PAIRS; k++) {
+        // Welsch 权重: exp(-r_k^2 / (2 * sigma_adapt^2))
+        float welsch = expf(-(r_k[k] * r_k[k]) / (2.0f * sigma_adapt * sigma_adapt));
+        
+        // 核心修正：距离平方根项明确引入 D_max 进行无量纲化归一化
+        float norm_geom = sqrtf(pair_conf[k].dist / D_max);
+        
+        // Alpha = 0.2 结构保护项
+        W_k[k] = Q_k[k] * ((1.0f - 0.2f) * welsch + 0.2f) * norm_geom;
+        
+        // 累加计算最终置信度指标
+        C_score += W_k[k];
+    }
+    
+    // 式(12): 归一化权重之和 C_score = (1/K) * Sum(W_k)
+    C_score /= NUM_PAIRS;
+
+    // “抵抗相关性野值雪崩的最后一道防线”
+    if (C_score < SAFE_LOWER_BOUND && s_doa_initialized) {
+        return s_last_valid_angle; // 拒绝无效帧，保留平滑历史
+    }
+
+    // 5. 论文 2.4 节: IRLS 连续域标量寻优
+    current_ang = ang_coarse;
+    for (iter = 0; iter < 8; iter++) {
+        H = 0.0f;
+        G = 0.0f;
+        valid_count = 0;
+        
+        cos_t = cosf(current_ang * DEG2RAD);
+        sin_t = sinf(current_ang * DEG2RAD);
+        
+        for (k = 0; k < NUM_PAIRS; k++) {
+            if (W_k[k] < 1e-4f) continue;
+            valid_count++;
+            
+            theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+            
+            // 式(13): 标量偏导数 J_k
+            J_k = DEG2RAD * (-pair_conf[k].dx * sin_t + pair_conf[k].dy * cos_t) / SOUND_SPEED;
+            
+            // 式(14-15): Hessian 近似与梯度 G
+            H += W_k[k] * J_k * J_k;
+            G += W_k[k] * J_k * (theo_tdoa - tau_meas[k]);
+        }
+        if (valid_count < 3) break;
+        
+        // 吉洪诺夫正则化 lambda = 1e-12
+        H += 1e-12f;
+        
+        // 式(16): 更新步长
+        float delta_ang = -G / H;
+        current_ang += delta_ang;
+        
+        if (fabsf(delta_ang) < 1e-3f) break; // 满足收敛阈值
+    }
+    
+    // 角度卷绕规约
+    current_ang = fmodf(current_ang + 180.0f, 360.0f);
+    if (current_ang < 0) current_ang += 360.0f;
+    current_ang -= 180.0f;
+
     s_last_valid_angle = current_ang;
     s_doa_initialized = 1;
 

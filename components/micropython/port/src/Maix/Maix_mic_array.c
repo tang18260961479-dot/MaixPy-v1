@@ -142,7 +142,7 @@ static float calculate_median(float* array, int size) {
     return temp[size / 2];
 }
 
-// 4. M-估计核心测向流水线 (原汁原味还原 MAD 核心，仅增加首尾状态控制)
+// 4. M-估计核心测向流水线
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
@@ -153,32 +153,23 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     // 严格 C89 变量声明
     int m, i, u, v, k, theta, p, iter;
     int search_range, max_idx, valid_count;
-    float window, frame_energy, vad_energy_threshold;
-    float cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
+    float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
     float min_cost, ang_coarse, cos_t, sin_t, cost, theo_tdoa, err;
     float cos_coarse, sin_coarse, med_res_m, sigma_adaptive_m, sigma_adaptive_t;
     float res_sq, w_consist;
     float ang_gn, sum_WJr, sum_WJJ, cos_gn, sin_gn, r_p, J_p, delta_ang;
-    float current_ang, diff, alpha;
+    float current_ang;
+    
+    // 论文“最后一道防线”相关变量
+    float total_weight, normalized_confidence;
+    float CONFIDENCE_THRESHOLD = 0.15f; // 安全下限阈值，可调
 
     float Meas_TDOA[NUM_PAIRS] = {0};
     float Qual_Score[NUM_PAIRS] = {0};
     float raw_residuals_t[NUM_PAIRS] = {0};
     float Final_W[NUM_PAIRS] = {0};
 
-    // --- 增量 1：VAD 拦截混响尾音 ---
-    frame_energy = 0.0f;
-    for (i = 0; i < FFT_N; i++) {
-        frame_energy += mic_data[6][i] * mic_data[6][i];
-    }
-    frame_energy /= FFT_N;
-    
-    vad_energy_threshold = 10.0f; // 可根据实验测得的背景 SNR 微调
-    if (frame_energy < vad_energy_threshold && s_doa_initialized) {
-        return s_last_valid_angle; 
-    }
-
-    // 绝对保留你的原版加窗与 FFT
+    // 加窗与正向 FFT
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -188,7 +179,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 绝对保留你的原版 1024 点全频带 GCC-PHAT 计算 (耗时完全一致)
+    // 1024 点 GCC-PHAT 计算
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
@@ -223,13 +214,13 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
             Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
             
-            // 绝对保留你的原版 MAD 评分阈值机制
+            // 严格执行你的原始论文 Sigmoid 评分
             Qual_Score[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
             k++;
         }
     }
 
-    // 绝对保留你的原版粗网格搜索
+    // 粗网格搜索
     min_cost = FLT_MAX;
     ang_coarse = 0.0f;
     for (theta = -180; theta < 180; theta++) {
@@ -245,7 +236,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
     }
 
-    // 绝对保留你的原版自适应权重
+    // 自适应尺度参数计算 (自适应 sigma_adapt)
     cos_coarse = cosf(ang_coarse * DEG2RAD);
     sin_coarse = sinf(ang_coarse * DEG2RAD);
     for (p = 0; p < NUM_PAIRS; p++) {
@@ -258,13 +249,29 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     if (sigma_adaptive_m > 0.10f) sigma_adaptive_m = 0.10f;
     sigma_adaptive_t = sigma_adaptive_m / SOUND_SPEED;
 
+    // 计算最终一致性权重 W_p
     for (p = 0; p < NUM_PAIRS; p++) {
         res_sq = raw_residuals_t[p] * raw_residuals_t[p];
         w_consist = expf(-res_sq / (2.0f * sigma_adaptive_t * sigma_adaptive_t));
         Final_W[p] = Qual_Score[p] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[p].dist);
     }
 
-    // 绝对保留你的原版 Gauss-Newton 微调
+    // =====================================================================
+    // 论文 3.3 节：抵抗野值雪崩的“最后一道防线”
+    // 计算有效麦克风对的归一化权重之和
+    // =====================================================================
+    total_weight = 0.0f;
+    for (p = 0; p < NUM_PAIRS; p++) {
+        total_weight += Final_W[p];
+    }
+    normalized_confidence = total_weight / NUM_PAIRS;
+
+    // 若置信度低于预设下限，标记为不可靠，直接拦截，拒绝输出乱跳的角度
+    if (normalized_confidence < CONFIDENCE_THRESHOLD && s_doa_initialized) {
+        return s_last_valid_angle; 
+    }
+
+    // Gauss-Newton 微调 (只在置信度达标时执行，节省算力)
     ang_gn = ang_coarse;
     for (iter = 0; iter < 8; iter++) {
         sum_WJr = 0.0f;
@@ -287,28 +294,16 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (fabsf(delta_ang) < 1e-3f) break;
     }
     
+    // 角度规约
     ang_gn = fmodf(ang_gn + 180.0f, 360.0f);
     if (ang_gn < 0) ang_gn += 360.0f;
     current_ang = ang_gn - 180.0f;
 
-    // --- 增量 2：平滑桥接语音卡顿 ---
-    if (!s_doa_initialized) {
-        s_last_valid_angle = current_ang;
-        s_doa_initialized = 1;
-        return current_ang;
-    }
+    // 更新静态历史角度，供无声期拦截使用
+    s_last_valid_angle = current_ang;
+    s_doa_initialized = 1;
 
-    diff = current_ang - s_last_valid_angle;
-    if (diff > 180.0f) diff -= 360.0f;
-    if (diff < -180.0f) diff += 360.0f;
-
-    alpha = 0.2f;
-    s_last_valid_angle += alpha * diff;
-
-    if (s_last_valid_angle > 180.0f) s_last_valid_angle -= 360.0f;
-    if (s_last_valid_angle < -180.0f) s_last_valid_angle += 360.0f;
-
-    return s_last_valid_angle;
+    return current_ang;
 }
 
 // ============================================================================

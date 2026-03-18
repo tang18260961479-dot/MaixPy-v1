@@ -13,6 +13,7 @@
 #include "mphalport.h"
 #include "modMaix.h"
 #include "imlib.h"
+#include "py/mpthread.h"  
 
 #include "sleep.h"
 #include "lcd.h"
@@ -20,50 +21,39 @@
 #include "fpioa.h"
 #include "sipeed_sk9822.h"
 #include "py_image.h"
-
-// --- 底层硬件驱动 ---
 #include "i2s.h"
 #include "dmac.h"
 
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：核心宏定义、结构体与全局变量 (控制变量：严格保持一致)
+// 第一部分：全局变量与双核异步共享内存
 // ============================================================================
-
 #define FFT_N 1024
-#define NUM_MICS 7
-#define NUM_PAIRS 21
-#define SAMPLE_RATE 48000.0f
+#define NUM_MICS 7       
+#define NUM_PAIRS 21     
+#define SAMPLE_RATE 16000.0f  
 #define SOUND_SPEED 343.0f
 #undef PI
 #define PI 3.14159265358979323846f
 #define DEG2RAD (PI / 180.0f)
 
-typedef struct { 
-    int u; 
-    int v; 
-    float dist; 
-    float dx; 
-    float dy; 
-} MicPairConf;
-
+typedef struct { int u; int v; float dist; float dx; float dy; } MicPairConf;
 MicPairConf pair_conf[NUM_PAIRS];
 
-// DMA 接收专用内存池与标志位
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
-float mic_raw_float[NUM_MICS][FFT_N];
 
-// ============================================================================
-// 第二部分：纯 C 语言硬核数学与信号处理管线
-// ============================================================================
+static volatile float current_target_angle = 0.0f;     
+static float shared_doa_mic_data[NUM_MICS][FFT_N];     
+static volatile int shared_data_ready = 0;             
 
 static void init_array_geometry(void) {
     float R = 0.04f;
     float theta_mic[6] = {0, 60, 120, 180, 240, 300};
     float mic_pos_2d[NUM_MICS][2];
-    int i, j, k;
+    int i, j, k = 0;
+
     for(i = 0; i < 6; i++) {
         mic_pos_2d[i][0] = R * cosf(theta_mic[i] * DEG2RAD);
         mic_pos_2d[i][1] = R * sinf(theta_mic[i] * DEG2RAD);
@@ -71,11 +61,9 @@ static void init_array_geometry(void) {
     mic_pos_2d[6][0] = 0.0f; 
     mic_pos_2d[6][1] = 0.0f;
 
-    k = 0;
     for (i = 0; i < NUM_MICS; i++) {
         for (j = i + 1; j < NUM_MICS; j++) {
-            pair_conf[k].u = i; 
-            pair_conf[k].v = j;
+            pair_conf[k].u = i; pair_conf[k].v = j;
             pair_conf[k].dx = mic_pos_2d[j][0] - mic_pos_2d[i][0];
             pair_conf[k].dy = mic_pos_2d[j][1] - mic_pos_2d[i][1];
             pair_conf[k].dist = sqrtf(pair_conf[k].dx * pair_conf[k].dx + pair_conf[k].dy * pair_conf[k].dy);
@@ -85,7 +73,7 @@ static void init_array_geometry(void) {
 }
 
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
-    int i, j, k, l, p;
+    int i, j, k, l, p; 
     float tx, ty, u1, u2, z, cos_z, sin_z, t;
     j = 0;
     for (i = 0; i < n - 1; i++) {
@@ -93,281 +81,330 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
             tx = real[i]; real[i] = real[j]; real[j] = tx;
             ty = imag[i]; imag[i] = imag[j]; imag[j] = ty;
         }
-        k = n / 2;
-        while (k <= j) { j -= k; k /= 2; }
-        j += k;
+        k = n / 2; while (k <= j) { j -= k; k /= 2; } j += k;
     }
     for (l = 1; l < n; l *= 2) {
-        z = PI / l;
-        if (is_inverse) z = -z;
-        u1 = 1.0f; u2 = 0.0f;
-        cos_z = cosf(z); 
-        sin_z = sinf(z);
+        z = PI / l; if (is_inverse) z = -z;
+        u1 = 1.0f; u2 = 0.0f; 
+        cos_z = cosf(z); sin_z = sinf(z);
         for (j = 0; j < l; j++) {
             for (i = j; i < n; i += 2 * l) {
                 p = i + l;
-                tx = real[p] * u1 - imag[p] * u2;
+                tx = real[p] * u1 - imag[p] * u2; 
                 ty = real[p] * u2 + imag[p] * u1;
-                real[p] = real[i] - tx; 
-                imag[p] = imag[i] - ty;
-                real[i] += tx;          
-                imag[i] += ty;
+                real[p] = real[i] - tx; imag[p] = imag[i] - ty;
+                real[i] += tx; imag[i] += ty;
             }
-            t = u1;
-            u1 = t * cos_z - u2 * sin_z;
-            u2 = t * sin_z + u2 * cos_z;
+            t = u1; u1 = t * cos_z - u2 * sin_z; u2 = t * sin_z + u2 * cos_z;
         }
     }
-    if (is_inverse) {
-        for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; }
-    }
+    if (is_inverse) { for (i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
 }
 
 // ============================================================================
-// 算法 1：Baseline - TDOA Grid Search (真正学术意义上的传统等权重网格搜索)
+// 第二部分：测向管线 (纯 GCC-PHAT + 严谨的等权重网格搜索)
 // ============================================================================
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
+    // 严格 C90：所有变量必须在函数最顶端声明
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_real[FFT_N], R_imag[FFT_N];
+    float Meas_TDOA[NUM_PAIRS];
     
-    // 满足 C89 规范：局部变量顶部声明
-    int m, i, u, v, k, theta, p;
-    int search_range, max_idx;
+    int m, i, u, v, k, p, theta, max_idx, search_range;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float min_cost, best_ang, cost, cos_t, sin_t, theo_tdoa, err, final_ang;
-    
-    float Meas_TDOA[NUM_PAIRS] = {0};
+    float min_cost, cost, cos_t, sin_t, theo_tdoa, err, best_ang, raw_angle;
+
+    k = 0;
+    min_cost = FLT_MAX;
+    best_ang = 0.0f;
+    for(i=0; i<NUM_PAIRS; i++) { Meas_TDOA[i]=0.0f; }
 
     // 1. 加窗与正向 FFT
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
-            mic_real[m][i] = mic_data[m][i] * window;
+            mic_real[m][i] = mic_data[m][i] * window; 
             mic_imag[m][i] = 0.0f;
         }
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 2. GCC-PHAT 提取到达时间差 (TDOA)
-    k = 0;
+    // 2. GCC-PHAT 计算到达时间差 (TDOA)
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
+            max_val = 0; 
+            max_idx = 0; 
+            search_range = 8; 
+            delta = 0;
+
             for (i = 0; i < FFT_N; i++) {
                 cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
                 cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
                 mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag;
+                R_real[i] = cross_r / mag; 
                 R_imag[i] = cross_i / mag;
             }
             fft_radix2(R_real, R_imag, FFT_N, 1);
-
-            max_val = 0; 
-            max_idx = 0;
-            search_range = 8; 
-            for (i = 0; i <= search_range; i++) {
-                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
-            }
-            for (i = FFT_N - search_range; i < FFT_N; i++) {
-                if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
-            }
-
-            delta = 0;
+            
+            for (i = 0; i <= search_range; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
+            for (i = FFT_N - search_range; i < FFT_N; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
+            
             if (max_idx > 0 && max_idx < FFT_N - 1) {
-                y1 = R_real[max_idx - 1];
-                y2 = R_real[max_idx];
-                y3 = R_real[max_idx + 1];
+                y1 = R_real[max_idx - 1]; y2 = R_real[max_idx]; y3 = R_real[max_idx + 1];
                 denom = 2.0f * (y1 - 2.0f * y2 + y3);
                 if (fabsf(denom) > 1e-9f) delta = (y1 - y3) / denom;
             }
-            
             tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
             Meas_TDOA[k] = tau_samples / SAMPLE_RATE;
-            // 注意：已移除论文专属的 Sigmoid 质量得分提取逻辑，保持传统算法的原汁原味
+            // 剥离了你的创新点 (Sigmoid 质量打分)，恢复了传统 GCC 的盲目性
             k++;
         }
     }
 
-    // 3. 全空间粗网格搜索 (传统等权重最小二乘法)
-    min_cost = FLT_MAX;
-    best_ang = 0.0f;
+    // 3. 【学术基线核心】全空间粗网格搜索 (完全等权重，无先验屏蔽)
     for (theta = -180; theta < 180; theta++) {
-        cost = 0.0f;
-        cos_t = cosf(theta * DEG2RAD);
+        cost = 0.0f; 
+        cos_t = cosf(theta * DEG2RAD); 
         sin_t = sinf(theta * DEG2RAD);
         for (p = 0; p < NUM_PAIRS; p++) {
             theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
             err = theo_tdoa - Meas_TDOA[p];
-            // 严格对齐论文2.2节：剥离先验权重，对所有麦克风赋予等同权重进行误差平方和计算
-            cost += err * err; 
+            // 剥离了距离权重和质量权重，所有阵元对一视同仁
+            cost += err * err;
         }
         if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
 
-    // 角度卷绕处理
-    final_ang = fmodf(best_ang + 180.0f, 360.0f);
-    if (final_ang < 0) final_ang += 360.0f;
-    return final_ang - 180.0f;
-}
+    raw_angle = fmodf(best_ang + 180.0f, 360.0f);
+    if (raw_angle < 0) raw_angle += 360.0f;
+    raw_angle -= 180.0f;
 
-// ============================================================================
-// 第三部分：MicroPython 底层接口绑定 (与 M-估计版本完全一致)
-// ============================================================================
+    // ============================================================================
+    // 4. 【时间层锁定】：卡尔曼平滑防抖 (0.064s 纯物理时间版)
+    // ============================================================================
+    {
+        static int tracker_initialized = 0;
+        static float est_angle = 0.0f;
+        static float est_velocity = 0.0f;
+        
+        const float ALPHA = 0.3f;           
+        const float BETA  = 0.02f;          
+        const float HUBER_THRESH = 15.0f;   
+        const float dt = 0.064f; 
+        
+        float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
-// DMA 接收中断回调
-static int i2s_dma_cb(void *ctx) {
-    rx_flag = 1;
-    return 0;
-}
+        if (!tracker_initialized) {
+            est_angle = raw_angle; est_velocity = 0.0f; tracker_initialized = 1; return est_angle;
+        }
 
-STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
-{
-    enum {
-        ARG_i2s_d0, ARG_i2s_d1, ARG_i2s_d2, ARG_i2s_d3, ARG_i2s_ws, ARG_i2s_sclk, ARG_sk9822_dat, ARG_sk9822_clk,
-    };
+        pred_angle = est_angle + est_velocity * dt;
+        raw_residual = raw_angle - pred_angle;
+        while (raw_residual > 180.0f)  raw_residual -= 360.0f;
+        while (raw_residual < -180.0f) raw_residual += 360.0f;
 
-    static const mp_arg_t allowed_args[]={
-        {MP_QSTR_i2s_d0,    MP_ARG_INT, {.u_int = 23}},
-        {MP_QSTR_i2s_d1,    MP_ARG_INT, {.u_int = 22}},
-        {MP_QSTR_i2s_d2,    MP_ARG_INT, {.u_int = 21}},
-        {MP_QSTR_i2s_d3,    MP_ARG_INT, {.u_int = 20}},
-        {MP_QSTR_i2s_ws,    MP_ARG_INT, {.u_int = 19}},
-        {MP_QSTR_i2s_sclk,  MP_ARG_INT, {.u_int = 18}},
-        {MP_QSTR_sk9822_dat, MP_ARG_INT, {.u_int = 24}},
-        {MP_QSTR_sk9822_clk, MP_ARG_INT, {.u_int = 25}},
-    };
+        abs_res = fabsf(raw_residual);
+        robust_weight = 1.0f;
+        if (abs_res > HUBER_THRESH) robust_weight = HUBER_THRESH / abs_res;
+        robust_residual = raw_residual * robust_weight;
 
-    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
-    int i;
-    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+        est_angle = pred_angle + ALPHA * robust_residual;
+        est_velocity = est_velocity + BETA * (robust_residual / dt);
 
-    fpioa_set_function(args[ARG_i2s_d0].u_int, FUNC_I2S0_IN_D0);
-    fpioa_set_function(args[ARG_i2s_d1].u_int, FUNC_I2S0_IN_D1);
-    fpioa_set_function(args[ARG_i2s_d2].u_int, FUNC_I2S0_IN_D2);
-    fpioa_set_function(args[ARG_i2s_d3].u_int, FUNC_I2S0_IN_D3);
-    fpioa_set_function(args[ARG_i2s_ws].u_int, FUNC_I2S0_WS);
-    fpioa_set_function(args[ARG_i2s_sclk].u_int, FUNC_I2S0_SCLK);
-    fpioa_set_function(args[ARG_sk9822_dat].u_int, FUNC_GPIOHS0 + SK9822_DAT_GPIONUM);
-    fpioa_set_function(args[ARG_sk9822_clk].u_int, FUNC_GPIOHS0 + SK9822_CLK_GPIONUM);
+        while (est_angle > 180.0f)  est_angle -= 360.0f;
+        while (est_angle < -180.0f) est_angle += 360.0f;
 
-    sipeed_init_mic_array_led();
-
-    // 核心修复点：给 I2S 硬件上电并提供时钟信号
-    sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ); 
-    sysctl_clock_enable(SYSCTL_CLOCK_I2S0);
-
-    // 纯硬件级 I2S 初始化
-    i2s_init(I2S_DEVICE_0, I2S_RECEIVER, 0x0F);
-    for(i = 0; i < 4; i++){
-        i2s_rx_channel_config(I2S_DEVICE_0, I2S_CHANNEL_0 + i,
-                              RESOLUTION_32_BIT, SCLK_CYCLES_32,
-                              TRIGGER_LEVEL_4, STANDARD_MODE);
+        return est_angle;
     }
+}
+
+// ============================================================================
+// 第三部分：核心 API 与 【物理级 FD-PCF 频域束波成型 (绝对锁死)】
+// ============================================================================
+static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
+
+STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_i2s_d0, ARG_i2s_d1, ARG_i2s_d2, ARG_i2s_d3, ARG_i2s_ws, ARG_i2s_sclk, ARG_sk9822_dat, ARG_sk9822_clk, };
+    static const mp_arg_t allowed_args[]={{MP_QSTR_i2s_d0, MP_ARG_INT, {.u_int = 23}}, {MP_QSTR_i2s_d1, MP_ARG_INT, {.u_int = 22}}, {MP_QSTR_i2s_d2, MP_ARG_INT, {.u_int = 21}}, {MP_QSTR_i2s_d3, MP_ARG_INT, {.u_int = 20}}, {MP_QSTR_i2s_ws, MP_ARG_INT, {.u_int = 19}}, {MP_QSTR_i2s_sclk, MP_ARG_INT, {.u_int = 18}}, {MP_QSTR_sk9822_dat, MP_ARG_INT, {.u_int = 24}}, {MP_QSTR_sk9822_clk, MP_ARG_INT, {.u_int = 25}},};
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)]; int i;
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    fpioa_set_function(args[ARG_i2s_d0].u_int, FUNC_I2S0_IN_D0); fpioa_set_function(args[ARG_i2s_d1].u_int, FUNC_I2S0_IN_D1); fpioa_set_function(args[ARG_i2s_d2].u_int, FUNC_I2S0_IN_D2); fpioa_set_function(args[ARG_i2s_d3].u_int, FUNC_I2S0_IN_D3); fpioa_set_function(args[ARG_i2s_ws].u_int, FUNC_I2S0_WS); fpioa_set_function(args[ARG_i2s_sclk].u_int, FUNC_I2S0_SCLK); fpioa_set_function(args[ARG_sk9822_dat].u_int, FUNC_GPIOHS0 + SK9822_DAT_GPIONUM); fpioa_set_function(args[ARG_sk9822_clk].u_int, FUNC_GPIOHS0 + SK9822_CLK_GPIONUM);
+    sipeed_init_mic_array_led();
+    sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ); sysctl_clock_enable(SYSCTL_CLOCK_I2S0);
+    i2s_init(I2S_DEVICE_0, I2S_RECEIVER, 0x0F);
+    for(i = 0; i < 4; i++) i2s_rx_channel_config(I2S_DEVICE_0, I2S_CHANNEL_0 + i, RESOLUTION_32_BIT, SCLK_CYCLES_32, TRIGGER_LEVEL_4, STANDARD_MODE);
     i2s_set_sample_rate(I2S_DEVICE_0, SAMPLE_RATE);
-
     init_array_geometry();
-
-    // 注册 DMA 中断并开启传输
     dmac_set_irq(DMAC_CHANNEL4, i2s_dma_cb, NULL, 3);
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
-    
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
 
-STATIC mp_obj_t Maix_mic_array_deinit(void) {
-    return mp_const_true;
-}
+STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
 
-STATIC mp_obj_t Maix_mic_array_get_map(void) {
-    mp_raise_ValueError("Thermal map is disabled. Using high-precision DOA instead.");
-    return mp_const_none;
-}
-MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_map_obj, Maix_mic_array_get_map);
-
-// 获取高精度波达角的 Python 接口 (无参数)
-STATIC mp_obj_t Maix_mic_array_get_dir(void)
-{
+// ============================================================================
+// 录音外设：锁定 FD-PCF 零相位掩膜与亚采样级对齐
+// ============================================================================
+STATIC mp_obj_t Maix_mic_array_get_beam_audio(void) {
     volatile uint8_t retry = 100;
-    int i;
-    float final_angle;
+    static float mic_r_all[NUM_MICS][FFT_N];
+    float target_angle, cos_t, sin_t;
+    float mx[6] = {0.04f*cosf(0), 0.04f*cosf(60*DEG2RAD), 0.04f*cosf(120*DEG2RAD), 0.04f*cosf(180*DEG2RAD), 0.04f*cosf(240*DEG2RAD), 0.04f*cosf(300*DEG2RAD)};
+    float my[6] = {0.04f*sinf(0), 0.04f*sinf(60*DEG2RAD), 0.04f*sinf(120*DEG2RAD), 0.04f*sinf(180*DEG2RAD), 0.04f*sinf(240*DEG2RAD), 0.04f*sinf(300*DEG2RAD)};
     
-    while(rx_flag == 0) {
-        retry--;
-        msleep(1);
-        if(retry == 0) break;
-    }
+    static float mic_r[6][FFT_N];
+    static float mic_i[6][FFT_N];
+    static float out_r[FFT_N], out_i[FFT_N];
+    static float G_smooth[FFT_N/2 + 1] = {0};
     
-    if(rx_flag == 0 && retry == 0) {
-        mp_raise_OSError(MP_ETIMEDOUT);
-        return mp_const_false;
-    }
+    static int16_t pcm_out[FFT_N];
+    static float prev_x = 0.0f, prev_y = 0.0f;
+    int i, m, k;
+    float freq, omega, sum_r, sum_i, incoh_energy, tau, phase, a_r, a_i, Xr, Xi, Xa_r, Xa_i, coh_energy, pcf, gain, y, amplified;
+    mp_obj_t tuple[2];
+
+    while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
+    if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    // 解包 I2S 交织数据
     for (i = 0; i < FFT_N; i++) {
-        mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
-        mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
-        mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
-        mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
-        mic_raw_float[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
-        mic_raw_float[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
-        mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
+        mic_r_all[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
+        mic_r_all[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
+        mic_r_all[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
+        mic_r_all[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
+        mic_r_all[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
+        mic_r_all[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
+        mic_r_all[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16); 
     }
 
-    // 重启 DMA
+    if (shared_data_ready == 0) {
+        for(m=0; m<NUM_MICS; m++) {
+            for(i=0; i<FFT_N; i++) shared_doa_mic_data[m][i] = mic_r_all[m][i];
+        }
+        shared_data_ready = 1; 
+    }
+
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 运行 Baseline 1 管线
-    final_angle = run_doa_pipeline(mic_raw_float);
+    target_angle = current_target_angle;
+    cos_t = cosf(target_angle * DEG2RAD);
+    sin_t = sinf(target_angle * DEG2RAD);
 
-    return mp_obj_new_float(final_angle);
-}
-MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_dir_obj, Maix_mic_array_get_dir);
-
-// LED 环控制保持不变
-STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
-{
-    int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0};
-    uint32_t set_color;
-    mp_obj_t *items;
-    
-    mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
-    for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
-
-    mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
-    for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
-
-    set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
-
-    for (index = 0; index < 12; index++) {
-        led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
+    for(m=0; m<6; m++) {
+        for(i=0; i<FFT_N; i++) {
+            mic_r[m][i] = mic_r_all[m][i];
+            mic_i[m][i] = 0.0f;
+        }
+        fft_radix2(mic_r[m], mic_i[m], FFT_N, 0);
     }
 
-    sysctl_disable_irq();
-    sk9822_start_frame();
-    for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
-    sk9822_stop_frame();
-    sysctl_enable_irq();
+    out_r[0] = 0; out_i[0] = 0;
+    out_r[FFT_N/2] = 0; out_i[FFT_N/2] = 0;
 
+    for (k = 1; k < FFT_N/2; k++) {
+        freq = (float)k * SAMPLE_RATE / FFT_N;
+        omega = 2.0f * PI * freq;
+
+        sum_r = 0.0f; sum_i = 0.0f;
+        incoh_energy = 0.0f;
+
+        for (m = 0; m < 6; m++) {
+            tau = (mx[m]*cos_t + my[m]*sin_t) / SOUND_SPEED;
+            phase = omega * tau;
+            
+            a_r = cosf(phase);
+            a_i = sinf(phase);
+
+            Xr = mic_r[m][k];
+            Xi = mic_i[m][k];
+            
+            Xa_r = Xr * a_r - Xi * a_i;
+            Xa_i = Xr * a_i + Xi * a_r;
+
+            sum_r += Xa_r;
+            sum_i += Xa_i;
+            incoh_energy += (Xr*Xr + Xi*Xi);
+        }
+        
+        sum_r /= 6.0f;
+        sum_i /= 6.0f;
+        incoh_energy /= 6.0f;
+
+        coh_energy = sum_r*sum_r + sum_i*sum_i;
+        
+        pcf = coh_energy / (incoh_energy + 1e-12f);
+        if (pcf > 1.0f) pcf = 1.0f;
+
+        gain = pcf * pcf * pcf;
+        G_smooth[k] = 0.6f * G_smooth[k] + 0.4f * gain;
+
+        out_r[k] = sum_r * G_smooth[k] * 2.5f; 
+        out_i[k] = sum_i * G_smooth[k] * 2.5f;
+        out_r[FFT_N - k] = out_r[k];
+        out_i[FFT_N - k] = -out_i[k];
+    }
+
+    fft_radix2(out_r, out_i, FFT_N, 1);
+
+    for (i = 0; i < FFT_N; i++) {
+        y = out_r[i] - prev_x + 0.995f * prev_y;
+        prev_x = out_r[i];
+        prev_y = y;
+
+        amplified = y * 1.5f; 
+        if(amplified > 32767.0f) amplified = 32767.0f;
+        if(amplified < -32768.0f) amplified = -32768.0f;
+        pcm_out[i] = (int16_t)amplified;
+    }
+
+    tuple[0] = mp_obj_new_float(target_angle);
+    tuple[1] = mp_obj_new_bytes((const byte*)pcm_out, FFT_N * sizeof(int16_t));
+    return mp_obj_new_tuple(2, tuple);
+}
+MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_beam_audio_obj, Maix_mic_array_get_beam_audio);
+
+STATIC mp_obj_t Maix_mic_array_track_doa(void) {
+    static float local_mic_data[NUM_MICS][FFT_N];
+    int m, i; float new_angle;
+
+    if (shared_data_ready == 0) return mp_obj_new_float(current_target_angle);
+    for(m=0; m<NUM_MICS; m++) { for(i=0; i<FFT_N; i++) local_mic_data[m][i] = shared_doa_mic_data[m][i]; }
+    shared_data_ready = 0; 
+
+    MP_THREAD_GIL_EXIT(); new_angle = run_doa_pipeline(local_mic_data); MP_THREAD_GIL_ENTER();
+    
+    current_target_angle = new_angle;
+    return mp_obj_new_float(new_angle);
+}
+MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_track_doa_obj, Maix_mic_array_track_doa);
+
+STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0}; mp_obj_t *items; uint32_t set_color;
+    mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
+    for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
+    mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
+    for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
+    set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
+    for (index = 0; index < 12; index++) led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
+    sysctl_disable_irq(); sk9822_start_frame();
+    for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
+    sk9822_stop_frame(); sysctl_enable_irq();
     return mp_const_true;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);
 
-// 注册字典
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_beam_audio), MP_ROM_PTR(&Maix_mic_array_get_beam_audio_obj) },
+    { MP_ROM_QSTR(MP_QSTR_track_doa), MP_ROM_PTR(&Maix_mic_array_track_doa_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_map), MP_ROM_PTR(&Maix_mic_array_get_map_obj) },
 };
-
 STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
 
 const mp_obj_type_t Maix_mic_array_type = {
-    { &mp_type_type },
-    .name = MP_QSTR_MIC_ARRAY,
-    .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict,
+    { &mp_type_type }, .name = MP_QSTR_MIC_ARRAY, .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict,
 };

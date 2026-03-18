@@ -42,7 +42,7 @@ typedef struct {
 } MicPairConf;
 
 MicPairConf pair_conf[NUM_PAIRS];
-float mic_pos_2d[NUM_MICS][2]; // 【公平性对齐】：全局化物理坐标，保证所有算法共享统一基准
+float mic_pos_2d[NUM_MICS][2]; // 全局化物理坐标，保证所有算法共享统一基准
 
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
@@ -113,8 +113,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float P_MUSIC[360];
     
-    // 【C89规范对齐】变量统一定义在顶部
+    // 【编译修复】：所有涉及到的局部变量，严格集中在此处顶部声明
     int m, i, j, f, bin, iter, theta, theta_idx;
+    int start_bin, end_bin;
     float window, df, freq, omega;
     float Rxx_r[NUM_MICS][NUM_MICS], Rxx_i[NUM_MICS][NUM_MICS];
     float V_r[NUM_MICS], V_i[NUM_MICS], V_new_r[NUM_MICS], V_new_i[NUM_MICS];
@@ -122,7 +123,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float a_r[NUM_MICS], a_i[NUM_MICS], y_r[NUM_MICS], y_i[NUM_MICS];
     float norm_sq, norm, vvH_r, vvH_i, phase, cos_t, sin_t, val_r;
     float max_P, best_ang, final_ang;
-    int start_bin, end_bin;
+    float xr, xi, yr, yi; 
     
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
@@ -162,11 +163,11 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
         for (f = 0; f < N_FRAMES; f++) {
             for (i = 0; i < NUM_MICS; i++) {
-                float xr = X_history_r[f][i][bin];
-                float xi = X_history_i[f][i][bin];
+                xr = X_history_r[f][i][bin];
+                xi = X_history_i[f][i][bin];
                 for (j = 0; j < NUM_MICS; j++) {
-                    float yr = X_history_r[f][j][bin];
-                    float yi = X_history_i[f][j][bin];
+                    yr = X_history_r[f][j][bin];
+                    yi = X_history_i[f][j][bin];
                     Rxx_r[i][j] += (xr * yr + xi * yi);
                     Rxx_i[i][j] += (xi * yr - xr * yi);
                 }
@@ -258,19 +259,58 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     return final_ang - 180.0f;
 }
 
-// === MicroPython 绑定部分保持不变 (省略以节省空间，直接沿用你发给我的尾部代码即可) ===
-static int i2s_dma_cb(void *ctx) { rx_flag = 1; return 0; }
-STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) { /* 同原版 */ return mp_const_true; }
+// ============================================================================
+// 第三部分：MicroPython 底层接口绑定
+// ============================================================================
+
+static int i2s_dma_cb(void *ctx) {
+    rx_flag = 1; return 0;
+}
+
+STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+{
+    enum { ARG_i2s_d0, ARG_i2s_d1, ARG_i2s_d2, ARG_i2s_d3, ARG_i2s_ws, ARG_i2s_sclk, ARG_sk9822_dat, ARG_sk9822_clk, };
+    static const mp_arg_t allowed_args[]={
+        {MP_QSTR_i2s_d0, MP_ARG_INT, {.u_int = 23}}, {MP_QSTR_i2s_d1, MP_ARG_INT, {.u_int = 22}},
+        {MP_QSTR_i2s_d2, MP_ARG_INT, {.u_int = 21}}, {MP_QSTR_i2s_d3, MP_ARG_INT, {.u_int = 20}},
+        {MP_QSTR_i2s_ws, MP_ARG_INT, {.u_int = 19}}, {MP_QSTR_i2s_sclk, MP_ARG_INT, {.u_int = 18}},
+        {MP_QSTR_sk9822_dat, MP_ARG_INT, {.u_int = 24}}, {MP_QSTR_sk9822_clk, MP_ARG_INT, {.u_int = 25}},
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    int i;
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    fpioa_set_function(args[ARG_i2s_d0].u_int, FUNC_I2S0_IN_D0); fpioa_set_function(args[ARG_i2s_d1].u_int, FUNC_I2S0_IN_D1);
+    fpioa_set_function(args[ARG_i2s_d2].u_int, FUNC_I2S0_IN_D2); fpioa_set_function(args[ARG_i2s_d3].u_int, FUNC_I2S0_IN_D3);
+    fpioa_set_function(args[ARG_i2s_ws].u_int, FUNC_I2S0_WS); fpioa_set_function(args[ARG_i2s_sclk].u_int, FUNC_I2S0_SCLK);
+    fpioa_set_function(args[ARG_sk9822_dat].u_int, FUNC_GPIOHS0 + SK9822_DAT_GPIONUM);
+    fpioa_set_function(args[ARG_sk9822_clk].u_int, FUNC_GPIOHS0 + SK9822_CLK_GPIONUM);
+
+    sipeed_init_mic_array_led();
+    sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ); sysctl_clock_enable(SYSCTL_CLOCK_I2S0);
+    i2s_init(I2S_DEVICE_0, I2S_RECEIVER, 0x0F);
+    for(i = 0; i < 4; i++) i2s_rx_channel_config(I2S_DEVICE_0, I2S_CHANNEL_0 + i, RESOLUTION_32_BIT, SCLK_CYCLES_32, TRIGGER_LEVEL_4, STANDARD_MODE);
+    i2s_set_sample_rate(I2S_DEVICE_0, SAMPLE_RATE);
+    init_array_geometry();
+    dmac_set_irq(DMAC_CHANNEL4, i2s_dma_cb, NULL, 3);
+    i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
+    
+    return mp_const_true;
+}
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
+
 STATIC mp_obj_t Maix_mic_array_deinit(void) { return mp_const_true; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_deinit_obj, Maix_mic_array_deinit);
+
 STATIC mp_obj_t Maix_mic_array_get_map(void) { mp_raise_ValueError("Disabled."); return mp_const_none; }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_map_obj, Maix_mic_array_get_map);
+
 STATIC mp_obj_t Maix_mic_array_get_dir(void) {
     volatile uint8_t retry = 100; int i;
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
+
     for (i = 0; i < FFT_N; i++) {
         mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16); mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
         mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16); mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
@@ -278,16 +318,32 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void) {
         mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
     }
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
+
     float final_angle = run_doa_pipeline(mic_raw_float);
     return mp_obj_new_float(final_angle);
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_dir_obj, Maix_mic_array_get_dir);
-STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) { /* 同原版 */ return mp_const_true; }
+
+STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0}; mp_obj_t *items; uint32_t set_color;
+    mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
+    for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);
+    mp_obj_get_array_fixed_n(pos_args[1], 3, &items);
+    for(index = 0; index < 3; index++) color[index] = mp_obj_get_int(items[index]);
+    set_color = (color[2] << 16) | (color[1] << 8) | (color[0]);
+    for (index = 0; index < 12; index++) led_color[index] = (brightness[index] / 2) > 1 ? (((0xe0 | (brightness[index] * 2)) << 24) | set_color) : 0xe0000000;
+    sysctl_disable_irq(); sk9822_start_frame();
+    for (index = 0; index < 12; index++) sk9822_send_data(led_color[index]);
+    sk9822_stop_frame(); sysctl_enable_irq();
+    return mp_const_true;
+}
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_set_led_obj, 2, Maix_mic_array_set_led);
+
 STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) }, { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) }, { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_map), MP_ROM_PTR(&Maix_mic_array_get_map_obj) },
 };
 STATIC MP_DEFINE_CONST_DICT(Maix_mic_array_dict, Maix_mic_array_locals_dict_table);
+
 const mp_obj_type_t Maix_mic_array_type = { { &mp_type_type }, .name = MP_QSTR_MIC_ARRAY, .locals_dict = (mp_obj_dict_t*)&Maix_mic_array_dict, };

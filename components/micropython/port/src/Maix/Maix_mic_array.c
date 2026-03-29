@@ -36,9 +36,10 @@
 #define NUM_PAIRS 21
 #define SAMPLE_RATE 48000.0f
 #define SOUND_SPEED 343.0f
-#undef PI
-#define PI 3.14159265358979323846f
-#define DEG2RAD (PI / 180.0f)
+
+/* Renamed to prevent any preprocessor macro collision in CI */
+#define MAD_PI 3.14159265358979323846f
+#define MAD_DEG2RAD (MAD_PI / 180.0f)
 
 typedef struct { 
     int u; 
@@ -49,7 +50,7 @@ typedef struct {
 } MicPairConf;
 
 MicPairConf pair_conf[NUM_PAIRS];
-float D_max = 0.08f; /* Array Maximum Physical Aperture for Normalization */
+float D_max = 0.08f; /* Array Maximum Physical Aperture */
 
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
@@ -61,14 +62,17 @@ float mic_raw_float[NUM_MICS][FFT_N];
 
 static void init_array_geometry(void) {
     float R = 0.04f;
-    float theta_mic[6] = {0, 60, 120, 180, 240, 300};
+    float theta_mic[6];
     float mic_pos_2d[NUM_MICS][2];
     int i, j, k;
-    float max_d = 0.0f; /* FIXED: Strict C89 Declaration at top of block */
+    float max_d = 0.0f;
+
+    theta_mic[0] = 0.0f; theta_mic[1] = 60.0f; theta_mic[2] = 120.0f;
+    theta_mic[3] = 180.0f; theta_mic[4] = 240.0f; theta_mic[5] = 300.0f;
 
     for(i = 0; i < 6; i++) {
-        mic_pos_2d[i][0] = R * cosf(theta_mic[i] * DEG2RAD);
-        mic_pos_2d[i][1] = R * sinf(theta_mic[i] * DEG2RAD);
+        mic_pos_2d[i][0] = R * cosf(theta_mic[i] * MAD_DEG2RAD);
+        mic_pos_2d[i][1] = R * sinf(theta_mic[i] * MAD_DEG2RAD);
     }
     mic_pos_2d[6][0] = 0.0f; 
     mic_pos_2d[6][1] = 0.0f;
@@ -85,7 +89,7 @@ static void init_array_geometry(void) {
             k++;
         }
     }
-    D_max = max_d; /* Automatically extract maximum aperture */
+    D_max = max_d; 
 }
 
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
@@ -103,7 +107,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
         j += k;
     }
     for (l = 1; l < n; l *= 2) {
-        z = PI / l;
+        z = MAD_PI / l;
         if (is_inverse) z = -z;
         u1 = 1.0f; u2 = 0.0f;
         cos_z = cosf(z); 
@@ -150,9 +154,14 @@ static float calculate_median(float* array, int size) {
 /* Core 4-Step IRLS Architecture Pipeline                                       */
 /* ============================================================================ */
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
+    /* Strict C89: ALL variables must be declared at the top */
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_real[FFT_N], R_imag[FFT_N];
+    
+    static int tracker_initialized = 0;
+    static float est_angle = 0.0f;
+    static float est_velocity = 0.0f;
     
     int m, i, u, v, k, theta, iter;
     int search_range, max_idx, valid_count;
@@ -174,11 +183,18 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float sum_WJr, sum_WJJ, cos_irls, sin_irls;
     float res_sq, w_consist, w_diag, J_p, delta_ang;
     float current_ang;
+    
+    float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
 
-    /* 1. Feature Extraction (Windowing and Forward FFT) */
+    for(i = 0; i < NUM_PAIRS; i++) {
+        Meas_TDOA[i] = 0.0f;
+        Qual_Score[i] = 0.0f;
+    }
+
+    /* 1. Feature Extraction */
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
-            window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
+            window = 0.54f - 0.46f * cosf(2.0f * MAD_PI * i / (FFT_N - 1));
             mic_real[m][i] = mic_data[m][i] * window;
             mic_imag[m][i] = 0.0f;
         }
@@ -220,13 +236,11 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    /* ------------------------------------------------------------- */
-    /* Step B: Quality-Aware Coarse Search                           */
-    /* ------------------------------------------------------------- */
+    /* Step B: Quality-Aware Coarse Search */
     min_cost_B = FLT_MAX; ang_B = 0.0f;
     for (theta = -180; theta < 180; theta += 1) { 
         cost = 0.0f;
-        cos_t = cosf(theta * DEG2RAD); sin_t = sinf(theta * DEG2RAD);
+        cos_t = cosf(theta * MAD_DEG2RAD); sin_t = sinf(theta * MAD_DEG2RAD);
         for (k = 0; k < NUM_PAIRS; k++) {
             if (Qual_Score[k] < 1e-3f) continue;
             theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
@@ -236,10 +250,8 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost_B) { min_cost_B = cost; ang_B = (float)theta; }
     }
 
-    /* ------------------------------------------------------------- */
-    /* Step C: Adaptive M-Estimation Coarse Search                   */
-    /* ------------------------------------------------------------- */
-    cos_B = cosf(ang_B * DEG2RAD); sin_B = sinf(ang_B * DEG2RAD);
+    /* Step C: Adaptive M-Estimation Coarse Search */
+    cos_B = cosf(ang_B * MAD_DEG2RAD); sin_B = sinf(ang_B * MAD_DEG2RAD);
     for (k = 0; k < NUM_PAIRS; k++) {
         theo_tdoa = (pair_conf[k].dx * cos_B + pair_conf[k].dy * sin_B) / SOUND_SPEED;
         raw_residuals_B[k] = fabsf(Meas_TDOA[k] - theo_tdoa);
@@ -247,21 +259,20 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     
     med_res_B = calculate_median(raw_residuals_B, NUM_PAIRS) * SOUND_SPEED;
     sigma_m_C = med_res_B * 1.5f;
-    if (sigma_m_C < 0.005f) sigma_m_C = 0.005f; /* 5mm Hardware Safety Bound */
+    if (sigma_m_C < 0.005f) sigma_m_C = 0.005f; 
     if (sigma_m_C > 0.10f)  sigma_m_C = 0.10f;
     sigma_t_C = sigma_m_C / SOUND_SPEED;
 
     for (k = 0; k < NUM_PAIRS; k++) {
         res_sq = raw_residuals_B[k] * raw_residuals_B[k];
         w_consist = expf(-res_sq / (2.0f * sigma_t_C * sigma_t_C));
-        /* Strict Topology: Q_k * [(1-a)*w + a] * sqrt(d_k / D_max) */
         W_C[k] = Qual_Score[k] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[k].dist / D_max);
     }
 
     min_cost_C = FLT_MAX; ang_C = 0.0f;
     for (theta = -180; theta < 180; theta += 1) {
         cost = 0.0f;
-        cos_t = cosf(theta * DEG2RAD); sin_t = sinf(theta * DEG2RAD);
+        cos_t = cosf(theta * MAD_DEG2RAD); sin_t = sinf(theta * MAD_DEG2RAD);
         for (k = 0; k < NUM_PAIRS; k++) {
             if (W_C[k] < 1e-4f) continue;
             theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
@@ -271,30 +282,25 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost_C) { min_cost_C = cost; ang_C = (float)theta; }
     }
 
-    /* ------------------------------------------------------------- */
-    /* Step D: True IRLS Continuous Domain Refinement                */
-    /* ------------------------------------------------------------- */
+    /* Step D: True IRLS Continuous Domain Refinement */
     ang_irls = ang_C;
     for (iter = 0; iter < 8; iter++) {
         sum_WJr = 0.0f; sum_WJJ = 0.0f; valid_count = 0;
         
-        cos_irls = cosf(ang_irls * DEG2RAD); sin_irls = sinf(ang_irls * DEG2RAD);
+        cos_irls = cosf(ang_irls * MAD_DEG2RAD); sin_irls = sinf(ang_irls * MAD_DEG2RAD);
         
-        /* 1. Real-time Residual Recalculation */
         for (k = 0; k < NUM_PAIRS; k++) {
             theo_tdoa = (pair_conf[k].dx * cos_irls + pair_conf[k].dy * sin_irls) / SOUND_SPEED;
             r_irls[k] = theo_tdoa - Meas_TDOA[k];
             raw_res_irls[k] = fabsf(r_irls[k]);
         }
         
-        /* 2. Dynamic MAD Scale Extraction */
         med_res = calculate_median(raw_res_irls, NUM_PAIRS) * SOUND_SPEED;
         sigma_m = med_res * 1.5f;
         if (sigma_m < 0.005f) sigma_m = 0.005f; 
         if (sigma_m > 0.10f)  sigma_m = 0.10f;
         sigma_t = sigma_m / SOUND_SPEED;
 
-        /* 3. Dynamic Composite Weight and Gradient Accumulation */
         for (k = 0; k < NUM_PAIRS; k++) {
             if (Qual_Score[k] < 1e-4f) continue;
             
@@ -302,7 +308,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             w_consist = expf(-res_sq / (2.0f * sigma_t * sigma_t));
             w_diag = Qual_Score[k] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[k].dist / D_max);
             
-            J_p = DEG2RAD * (-pair_conf[k].dx * sin_irls + pair_conf[k].dy * cos_irls) / SOUND_SPEED;
+            J_p = MAD_DEG2RAD * (-pair_conf[k].dx * sin_irls + pair_conf[k].dy * cos_irls) / SOUND_SPEED;
             
             if (w_diag > 0.0f) {
                 valid_count++;
@@ -314,43 +320,34 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (valid_count < 3) break;
         delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
         ang_irls += delta_ang; 
-        if (fabsf(delta_ang) < 1e-3f) break; /* Convergence */
+        if (fabsf(delta_ang) < 1e-3f) break; 
     }
     
-    /* Angle Wrap-around Rectification */
     current_ang = fmodf(ang_irls + 180.0f, 360.0f);
     if (current_ang < 0) current_ang += 360.0f;
     current_ang -= 180.0f;
 
-    /* --- 1D Huber Kalman Smoothing (Prevent Physical Jitter) --- */
-    {
-        static int tracker_initialized = 0;
-        static float est_angle = 0.0f;
-        static float est_velocity = 0.0f;
-        const float ALPHA = 0.3f, BETA = 0.02f, HUBER_THRESH = 15.0f, dt = 0.064f; 
-        float pred_angle, raw_residual, abs_res, robust_weight, robust_residual;
-
-        if (!tracker_initialized) {
-            est_angle = current_ang; est_velocity = 0.0f; tracker_initialized = 1; return est_angle;
-        }
-
-        pred_angle = est_angle + est_velocity * dt;
-        raw_residual = current_ang - pred_angle;
-        while (raw_residual > 180.0f)  raw_residual -= 360.0f;
-        while (raw_residual < -180.0f) raw_residual += 360.0f;
-
-        abs_res = fabsf(raw_residual);
-        robust_weight = 1.0f;
-        if (abs_res > HUBER_THRESH) robust_weight = HUBER_THRESH / abs_res;
-        robust_residual = raw_residual * robust_weight;
-
-        est_angle = pred_angle + ALPHA * robust_residual;
-        est_velocity = est_velocity + BETA * (robust_residual / dt);
-        while (est_angle > 180.0f)  est_angle -= 360.0f;
-        while (est_angle < -180.0f) est_angle += 360.0f;
-
-        return est_angle;
+    /* 1D Huber Kalman Smoothing */
+    if (!tracker_initialized) {
+        est_angle = current_ang; est_velocity = 0.0f; tracker_initialized = 1; return est_angle;
     }
+
+    pred_angle = est_angle + est_velocity * 0.064f;
+    raw_residual = current_ang - pred_angle;
+    while (raw_residual > 180.0f)  raw_residual -= 360.0f;
+    while (raw_residual < -180.0f) raw_residual += 360.0f;
+
+    abs_res = fabsf(raw_residual);
+    robust_weight = 1.0f;
+    if (abs_res > 15.0f) robust_weight = 15.0f / abs_res;
+    robust_residual = raw_residual * robust_weight;
+
+    est_angle = pred_angle + 0.3f * robust_residual;
+    est_velocity = est_velocity + 0.02f * (robust_residual / 0.064f);
+    while (est_angle > 180.0f)  est_angle -= 360.0f;
+    while (est_angle < -180.0f) est_angle += 360.0f;
+
+    return est_angle;
 }
 
 /* ============================================================================ */
@@ -365,7 +362,7 @@ static int i2s_dma_cb(void *ctx) {
 STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
     enum {
-        ARG_i2s_d0, ARG_i2s_d1, ARG_i2s_d2, ARG_i2s_d3, ARG_i2s_ws, ARG_i2s_sclk, ARG_sk9822_dat, ARG_sk9822_clk,
+        ARG_i2s_d0, ARG_i2s_d1, ARG_i2s_d2, ARG_i2s_d3, ARG_i2s_ws, ARG_i2s_sclk, ARG_sk9822_dat, ARG_sk9822_clk
     };
 
     static const mp_arg_t allowed_args[]={
@@ -376,11 +373,12 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
         {MP_QSTR_i2s_ws,    MP_ARG_INT, {.u_int = 19}},
         {MP_QSTR_i2s_sclk,  MP_ARG_INT, {.u_int = 18}},
         {MP_QSTR_sk9822_dat, MP_ARG_INT, {.u_int = 24}},
-        {MP_QSTR_sk9822_clk, MP_ARG_INT, {.u_int = 25}},
+        {MP_QSTR_sk9822_clk, MP_ARG_INT, {.u_int = 25}}
     };
 
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     int i;
+    
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     fpioa_set_function(args[ARG_i2s_d0].u_int, FUNC_I2S0_IN_D0);
@@ -463,9 +461,15 @@ MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_dir_obj, Maix_mic_array_get_dir);
 
 STATIC mp_obj_t Maix_mic_array_set_led(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
-    int index, brightness[12] = {0}, led_color[12] = {0}, color[3] = {0};
+    int index;
+    int brightness[12];
+    int led_color[12];
+    int color[3];
     uint32_t set_color;
     mp_obj_t *items;
+    
+    for(index = 0; index < 12; index++) { brightness[index] = 0; led_color[index] = 0; }
+    for(index = 0; index < 3; index++) color[index] = 0;
     
     mp_obj_get_array_fixed_n(pos_args[0], 12, &items);
     for(index= 0; index < 12; index++) brightness[index] = mp_obj_get_int(items[index]);

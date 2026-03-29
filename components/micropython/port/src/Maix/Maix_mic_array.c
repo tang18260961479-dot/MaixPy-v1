@@ -21,15 +21,15 @@
 #include "sipeed_sk9822.h"
 #include "py_image.h"
 
-// --- 底层硬件驱动 ---
+/* --- Hardware Drivers --- */
 #include "i2s.h"
 #include "dmac.h"
 
 #define PLL2_OUTPUT_FREQ 45158400UL
 
-// ============================================================================
-// 第一部分：M-估计 DOA 算法的核心宏定义、结构体与全局变量
-// ============================================================================
+/* ============================================================================ */
+/* Part 1: M-Estimator DOA Algorithm Macros, Structs and Globals                */
+/* ============================================================================ */
 
 #define FFT_N 1024
 #define NUM_MICS 7
@@ -49,21 +49,22 @@ typedef struct {
 } MicPairConf;
 
 MicPairConf pair_conf[NUM_PAIRS];
-float D_max = 0.08f; // 阵列最大物理孔径 (归一化基准)
+float D_max = 0.08f; /* Array Maximum Physical Aperture for Normalization */
 
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 float mic_raw_float[NUM_MICS][FFT_N];
 
-// ============================================================================
-// 第二部分：纯 C 语言硬核数学与信号处理管线 
-// ============================================================================
+/* ============================================================================ */
+/* Part 2: Pure C Hardcore Math and Signal Processing Pipeline                  */
+/* ============================================================================ */
 
 static void init_array_geometry(void) {
     float R = 0.04f;
     float theta_mic[6] = {0, 60, 120, 180, 240, 300};
     float mic_pos_2d[NUM_MICS][2];
     int i, j, k;
+    float max_d = 0.0f; /* FIXED: Strict C89 Declaration at top of block */
 
     for(i = 0; i < 6; i++) {
         mic_pos_2d[i][0] = R * cosf(theta_mic[i] * DEG2RAD);
@@ -73,7 +74,6 @@ static void init_array_geometry(void) {
     mic_pos_2d[6][1] = 0.0f;
 
     k = 0;
-    float max_d = 0.0f;
     for (i = 0; i < NUM_MICS; i++) {
         for (j = i + 1; j < NUM_MICS; j++) {
             pair_conf[k].u = i; 
@@ -85,7 +85,7 @@ static void init_array_geometry(void) {
             k++;
         }
     }
-    D_max = max_d; // 自动推导最大孔径
+    D_max = max_d; /* Automatically extract maximum aperture */
 }
 
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
@@ -146,32 +146,28 @@ static float calculate_median(float* array, int size) {
     return temp[size / 2]; 
 }
 
-// ============================================================================
-// ★ 核心替换区域：4 步 IRLS 架构管线
-// ============================================================================
+/* ============================================================================ */
+/* Core 4-Step IRLS Architecture Pipeline                                       */
+/* ============================================================================ */
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_real[FFT_N], R_imag[FFT_N];
-    static float s_last_valid_angle = 0.0f;
-    static int s_doa_initialized = 0;
     
     int m, i, u, v, k, theta, iter;
     int search_range, max_idx, valid_count;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
     float cost, cos_t, sin_t, theo_tdoa, err;
     
-    float Meas_TDOA[NUM_PAIRS] = {0};
-    float Qual_Score[NUM_PAIRS] = {0};
+    float Meas_TDOA[NUM_PAIRS];
+    float Qual_Score[NUM_PAIRS];
     
-    // 算法步骤状态变量
     float min_cost_B, ang_B;
     float raw_residuals_B[NUM_PAIRS];
     float cos_B, sin_B, med_res_B, sigma_m_C, sigma_t_C;
     float W_C[NUM_PAIRS];
     float min_cost_C, ang_C;
     
-    // 真 IRLS 迭代变量
     float ang_irls;
     float r_irls[NUM_PAIRS], raw_res_irls[NUM_PAIRS];
     float med_res, sigma_m, sigma_t;
@@ -179,7 +175,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float res_sq, w_consist, w_diag, J_p, delta_ang;
     float current_ang;
 
-    // 1. 特征提取 (加窗与正向 FFT)
+    /* 1. Feature Extraction (Windowing and Forward FFT) */
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
             window = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1));
@@ -189,7 +185,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 2. 前端 GCC-PHAT
+    /* 2. Frontend GCC-PHAT */
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
@@ -224,9 +220,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         }
     }
 
-    // -------------------------------------------------------------
-    // 【步骤 B：质量感知粗搜】
-    // -------------------------------------------------------------
+    /* ------------------------------------------------------------- */
+    /* Step B: Quality-Aware Coarse Search                           */
+    /* ------------------------------------------------------------- */
     min_cost_B = FLT_MAX; ang_B = 0.0f;
     for (theta = -180; theta < 180; theta += 1) { 
         cost = 0.0f;
@@ -240,9 +236,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost_B) { min_cost_B = cost; ang_B = (float)theta; }
     }
 
-    // -------------------------------------------------------------
-    // 【步骤 C：自适应 M-估计粗搜】
-    // -------------------------------------------------------------
+    /* ------------------------------------------------------------- */
+    /* Step C: Adaptive M-Estimation Coarse Search                   */
+    /* ------------------------------------------------------------- */
     cos_B = cosf(ang_B * DEG2RAD); sin_B = sinf(ang_B * DEG2RAD);
     for (k = 0; k < NUM_PAIRS; k++) {
         theo_tdoa = (pair_conf[k].dx * cos_B + pair_conf[k].dy * sin_B) / SOUND_SPEED;
@@ -251,14 +247,14 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     
     med_res_B = calculate_median(raw_residuals_B, NUM_PAIRS) * SOUND_SPEED;
     sigma_m_C = med_res_B * 1.5f;
-    if (sigma_m_C < 0.015f) sigma_m_C = 0.015f; // 15mm 硬件底层防线
+    if (sigma_m_C < 0.005f) sigma_m_C = 0.005f; /* 5mm Hardware Safety Bound */
     if (sigma_m_C > 0.10f)  sigma_m_C = 0.10f;
     sigma_t_C = sigma_m_C / SOUND_SPEED;
 
     for (k = 0; k < NUM_PAIRS; k++) {
         res_sq = raw_residuals_B[k] * raw_residuals_B[k];
         w_consist = expf(-res_sq / (2.0f * sigma_t_C * sigma_t_C));
-        // 严格拓扑: Q_k * [(1-a)*w + a] * sqrt(d_k / D_max)
+        /* Strict Topology: Q_k * [(1-a)*w + a] * sqrt(d_k / D_max) */
         W_C[k] = Qual_Score[k] * ((1.0f - 0.2f) * w_consist + 0.2f) * sqrtf(pair_conf[k].dist / D_max);
     }
 
@@ -275,30 +271,30 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (cost < min_cost_C) { min_cost_C = cost; ang_C = (float)theta; }
     }
 
-    // -------------------------------------------------------------
-    // 【步骤 D：完全体 - 真 IRLS 连续域精调】
-    // -------------------------------------------------------------
+    /* ------------------------------------------------------------- */
+    /* Step D: True IRLS Continuous Domain Refinement                */
+    /* ------------------------------------------------------------- */
     ang_irls = ang_C;
     for (iter = 0; iter < 8; iter++) {
         sum_WJr = 0.0f; sum_WJJ = 0.0f; valid_count = 0;
         
         cos_irls = cosf(ang_irls * DEG2RAD); sin_irls = sinf(ang_irls * DEG2RAD);
         
-        // 1. 实时重算残差
+        /* 1. Real-time Residual Recalculation */
         for (k = 0; k < NUM_PAIRS; k++) {
             theo_tdoa = (pair_conf[k].dx * cos_irls + pair_conf[k].dy * sin_irls) / SOUND_SPEED;
             r_irls[k] = theo_tdoa - Meas_TDOA[k];
             raw_res_irls[k] = fabsf(r_irls[k]);
         }
         
-        // 2. 动态提取最新 MAD 标尺
+        /* 2. Dynamic MAD Scale Extraction */
         med_res = calculate_median(raw_res_irls, NUM_PAIRS) * SOUND_SPEED;
         sigma_m = med_res * 1.5f;
         if (sigma_m < 0.005f) sigma_m = 0.005f; 
         if (sigma_m > 0.10f)  sigma_m = 0.10f;
         sigma_t = sigma_m / SOUND_SPEED;
 
-        // 3. 动态刷新复合权重与梯度累加
+        /* 3. Dynamic Composite Weight and Gradient Accumulation */
         for (k = 0; k < NUM_PAIRS; k++) {
             if (Qual_Score[k] < 1e-4f) continue;
             
@@ -318,18 +314,15 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         if (valid_count < 3) break;
         delta_ang = -sum_WJr / (sum_WJJ + 1e-12f);
         ang_irls += delta_ang; 
-        if (fabsf(delta_ang) < 1e-3f) break; // 收敛
+        if (fabsf(delta_ang) < 1e-3f) break; /* Convergence */
     }
     
-    // 角度卷绕规约
+    /* Angle Wrap-around Rectification */
     current_ang = fmodf(ang_irls + 180.0f, 360.0f);
     if (current_ang < 0) current_ang += 360.0f;
     current_ang -= 180.0f;
 
-    s_last_valid_angle = current_ang;
-    s_doa_initialized = 1;
-
-    // --- 极简一维 Huber 卡尔曼平滑 (防止物理世界里的随机抖动) ---
+    /* --- 1D Huber Kalman Smoothing (Prevent Physical Jitter) --- */
     {
         static int tracker_initialized = 0;
         static float est_angle = 0.0f;
@@ -360,9 +353,9 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     }
 }
 
-// ============================================================================
-// 第三部分：MicroPython 底层接口绑定
-// ============================================================================
+/* ============================================================================ */
+/* Part 3: MicroPython Bindings                                                 */
+/* ============================================================================ */
 
 static int i2s_dma_cb(void *ctx) {
     rx_flag = 1;

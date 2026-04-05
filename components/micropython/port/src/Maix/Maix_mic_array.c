@@ -457,15 +457,17 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
 
-// 【基准测试接口】串行背靠背(Back-to-Back)运行所有算法
-STATIC mp_obj_t Maix_mic_array_get_benchmark(void)
+// 【升级版核心探针】：接收算法 ID，独立运行单帧并返回耗时与角度
+STATIC mp_obj_t Maix_mic_array_get_benchmark(mp_obj_t algo_id_obj)
 {
+    int algo_id = mp_obj_get_int(algo_id_obj);
     volatile uint8_t retry = 100;
+    
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    // 抓取并固化一帧时域数据 (保证四算法对比的绝对公平性)
+    // 抓取一帧真实音频数据
     for (int i = 0; i < FFT_N; i++) {
         mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16); mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
         mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16); mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
@@ -475,47 +477,32 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(void)
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
     uint64_t t_start, t_end;
-    float times_ms[4];
+    float ang = 0.0f;
 
-    printf("\n--- Starting Hardware Sequential Benchmark ---\n");
-
-    // 1. TDOA-Grid
+    // 独占式执行指定的算法，测算最纯净的硬件耗时
     t_start = sysctl_get_time_us();
-    float ang_grid = run_doa_grid(mic_raw_float);
+    if (algo_id == 0) {
+        ang = run_doa_grid(mic_raw_float);
+    } else if (algo_id == 1) {
+        ang = run_doa_proposed(mic_raw_float);
+    } else if (algo_id == 2) {
+        ang = run_doa_srp(mic_raw_float);
+    } else if (algo_id == 3) {
+        ang = run_doa_music(mic_raw_float);
+    }
     t_end = sysctl_get_time_us();
-    times_ms[0] = (t_end - t_start) / 1000.0f;
-    printf("[1] TDOA-Grid  -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[0], ang_grid);
 
-    // 2. Proposed (MAD + IRLS)
-    t_start = sysctl_get_time_us();
-    float ang_prop = run_doa_proposed(mic_raw_float);
-    t_end = sysctl_get_time_us();
-    times_ms[1] = (t_end - t_start) / 1000.0f;
-    printf("[2] Proposed   -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[1], ang_prop);
+    float cost_ms = (t_end - t_start) / 1000.0f;
 
-    // 3. SRP-PHAT
-    t_start = sysctl_get_time_us();
-    float ang_srp = run_doa_srp(mic_raw_float);
-    t_end = sysctl_get_time_us();
-    times_ms[2] = (t_end - t_start) / 1000.0f;
-    printf("[3] SRP-PHAT   -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[2], ang_srp);
-
-    // 4. Broadband MUSIC
-    t_start = sysctl_get_time_us();
-    float ang_music = run_doa_music(mic_raw_float);
-    t_end = sysctl_get_time_us();
-    times_ms[3] = (t_end - t_start) / 1000.0f;
-    printf("[4] B-MUSIC    -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[3], ang_music);
-
-    printf("------------------------------------------------\n\n");
-
-    mp_obj_t tuple[4] = {
-        mp_obj_new_float(times_ms[0]), mp_obj_new_float(times_ms[1]), 
-        mp_obj_new_float(times_ms[2]), mp_obj_new_float(times_ms[3])
+    // 返回一个元组: (耗时_ms, 测得角度)
+    mp_obj_t tuple[2] = {
+        mp_obj_new_float(cost_ms),
+        mp_obj_new_float(ang)
     };
-    return mp_obj_new_tuple(4, tuple);
+    return mp_obj_new_tuple(2, tuple);
 }
-MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_benchmark_obj, Maix_mic_array_get_benchmark);
+// 注意：这里改成了 FUN_OBJ_1，代表接收 1 个参数
+MP_DEFINE_CONST_FUN_OBJ_1(Maix_mic_array_get_benchmark_obj, Maix_mic_array_get_benchmark);
 
 STATIC mp_obj_t Maix_mic_array_get_dir(void) {
     volatile uint8_t retry = 100;

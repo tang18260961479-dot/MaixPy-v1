@@ -28,7 +28,7 @@
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：核心宏定义、结构体与共享全局变量
+// 第一部分：核心宏定义与统一共享全局变量 (Global Memory Pool)
 // ============================================================================
 #define FFT_N 1024
 #define NUM_MICS 7
@@ -48,7 +48,15 @@ float D_max = 0.08f;
 
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
-float mic_raw_float[NUM_MICS][FFT_N];
+
+// --- 统一共享的物理内存池 (避免BSS撑爆) ---
+float mic_raw_float[NUM_MICS][FFT_N];              // 统一时域原始数据
+float shared_mic_real[NUM_MICS][FFT_N];            // 统一FFT实部缓存
+float shared_mic_imag[NUM_MICS][FFT_N];            // 统一FFT虚部缓存
+float shared_cross_real[FFT_N];                    // 统一互相关实部缓存
+float shared_cross_imag[FFT_N];                    // 统一互相关虚部缓存
+float srp_R_phat_r[NUM_PAIRS][FFT_N / 2];          // SRP专属频域实部缓存
+float srp_R_phat_i[NUM_PAIRS][FFT_N / 2];          // SRP专属频域虚部缓存
 
 // ============================================================================
 // 第二部分：公共信号处理与数学库
@@ -120,38 +128,37 @@ static float calculate_median(float* array, int size) {
 }
 
 // ============================================================================
-// 第三部分：独立的核心算法封装
+// 第三部分：独立的算法函数 (共用内存，解决缩进编译报错)
 // ============================================================================
 
 // --- 算法 1：TDOA-Grid ---
-static float run_doa_grid(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N], mic_imag[NUM_MICS][FFT_N], R_real[FFT_N], R_imag[FFT_N];
+static float run_doa_grid(float raw_data[NUM_MICS][FFT_N]) {
     int m, i, u, v, k, theta, p; float Meas_TDOA[NUM_PAIRS] = {0};
     
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
-            mic_real[m][i] = mic_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
-            mic_imag[m][i] = 0.0f;
+            shared_mic_real[m][i] = raw_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
+            shared_mic_imag[m][i] = 0.0f;
         }
-        fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
+        fft_radix2(shared_mic_real[m], shared_mic_imag[m], FFT_N, 0);
     }
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
             for (i = 0; i < FFT_N; i++) {
-                float cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
-                float cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
+                float cross_r = shared_mic_real[u][i] * shared_mic_real[v][i] + shared_mic_imag[u][i] * shared_mic_imag[v][i];
+                float cross_i = shared_mic_imag[u][i] * shared_mic_real[v][i] - shared_mic_real[u][i] * shared_mic_imag[v][i];
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
+                shared_cross_real[i] = cross_r / mag; shared_cross_imag[i] = cross_i / mag;
             }
-            fft_radix2(R_real, R_imag, FFT_N, 1);
+            fft_radix2(shared_cross_real, shared_cross_imag, FFT_N, 1);
             float max_val = 0; int max_idx = 0;
-            for (i = 0; i <= 8; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
-            for (i = FFT_N - 8; i < FFT_N; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
+            for (i = 0; i <= 8; i++) { if (shared_cross_real[i] > max_val) { max_val = shared_cross_real[i]; max_idx = i; } }
+            for (i = FFT_N - 8; i < FFT_N; i++) { if (shared_cross_real[i] > max_val) { max_val = shared_cross_real[i]; max_idx = i; } }
             float delta = 0;
             if (max_idx > 0 && max_idx < FFT_N - 1) {
-                float denom = 2.0f * (R_real[max_idx - 1] - 2.0f * R_real[max_idx] + R_real[max_idx + 1]);
-                if (fabsf(denom) > 1e-9f) delta = (R_real[max_idx - 1] - R_real[max_idx + 1]) / denom;
+                float denom = 2.0f * (shared_cross_real[max_idx - 1] - 2.0f * shared_cross_real[max_idx] + shared_cross_real[max_idx + 1]);
+                if (fabsf(denom) > 1e-9f) delta = (shared_cross_real[max_idx - 1] - shared_cross_real[max_idx + 1]) / denom;
             }
             Meas_TDOA[k++] = ((max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta)) / SAMPLE_RATE;
         }
@@ -165,39 +172,43 @@ static float run_doa_grid(float mic_data[NUM_MICS][FFT_N]) {
         }
         if (cost < min_cost) { min_cost = cost; best_ang = (float)theta; }
     }
+    
+    // 【修复缩进报错】
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
-    if (final_ang < 0) final_ang += 360.0f; return final_ang - 180.0f;
+    if (final_ang < 0) {
+        final_ang += 360.0f;
+    }
+    return final_ang - 180.0f;
 }
 
 // --- 算法 2：Proposed (MAD) ---
-static float run_doa_proposed(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N], mic_imag[NUM_MICS][FFT_N], R_real[FFT_N], R_imag[FFT_N];
+static float run_doa_proposed(float raw_data[NUM_MICS][FFT_N]) {
     int m, i, u, v, k, theta, iter; float tau_meas[NUM_PAIRS] = {0}, Q_k[NUM_PAIRS] = {0};
     
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
-            mic_real[m][i] = mic_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
-            mic_imag[m][i] = 0.0f;
+            shared_mic_real[m][i] = raw_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
+            shared_mic_imag[m][i] = 0.0f;
         }
-        fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
+        fft_radix2(shared_mic_real[m], shared_mic_imag[m], FFT_N, 0);
     }
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
             for (i = 0; i < FFT_N; i++) {
-                float cross_r = mic_real[u][i] * mic_real[v][i] + mic_imag[u][i] * mic_imag[v][i];
-                float cross_i = mic_imag[u][i] * mic_real[v][i] - mic_real[u][i] * mic_imag[v][i];
+                float cross_r = shared_mic_real[u][i] * shared_mic_real[v][i] + shared_mic_imag[u][i] * shared_mic_imag[v][i];
+                float cross_i = shared_mic_imag[u][i] * shared_mic_real[v][i] - shared_mic_real[u][i] * shared_mic_imag[v][i];
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_real[i] = cross_r / mag; R_imag[i] = cross_i / mag;
+                shared_cross_real[i] = cross_r / mag; shared_cross_imag[i] = cross_i / mag;
             }
-            fft_radix2(R_real, R_imag, FFT_N, 1);
+            fft_radix2(shared_cross_real, shared_cross_imag, FFT_N, 1);
             float max_val = 0; int max_idx = 0;
-            for (i = 0; i <= 8; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
-            for (i = FFT_N - 8; i < FFT_N; i++) { if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; } }
+            for (i = 0; i <= 8; i++) { if (shared_cross_real[i] > max_val) { max_val = shared_cross_real[i]; max_idx = i; } }
+            for (i = FFT_N - 8; i < FFT_N; i++) { if (shared_cross_real[i] > max_val) { max_val = shared_cross_real[i]; max_idx = i; } }
             float delta = 0;
             if (max_idx > 0 && max_idx < FFT_N - 1) {
-                float denom = 2.0f * (R_real[max_idx - 1] - 2.0f * R_real[max_idx] + R_real[max_idx + 1]);
-                if (fabsf(denom) > 1e-9f) delta = (R_real[max_idx - 1] - R_real[max_idx + 1]) / denom;
+                float denom = 2.0f * (shared_cross_real[max_idx - 1] - 2.0f * shared_cross_real[max_idx] + shared_cross_real[max_idx + 1]);
+                if (fabsf(denom) > 1e-9f) delta = (shared_cross_real[max_idx - 1] - shared_cross_real[max_idx + 1]) / denom;
             }
             tau_meas[k] = ((max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta)) / SAMPLE_RATE;
             Q_k[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
@@ -222,7 +233,14 @@ static float run_doa_proposed(float mic_data[NUM_MICS][FFT_N]) {
         r_k[k] = SOUND_SPEED * fabsf(tau_meas[k] - ((pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED)); 
     }
     float sigma_adapt = calculate_median(r_k, NUM_PAIRS) * 1.5f;
-    if (sigma_adapt < 0.015f) sigma_adapt = 0.015f; if (sigma_adapt > 0.10f) sigma_adapt = 0.10f;
+    
+    // 【修复缩进报错】
+    if (sigma_adapt < 0.015f) {
+        sigma_adapt = 0.015f; 
+    }
+    if (sigma_adapt > 0.10f) {
+        sigma_adapt = 0.10f;
+    }
 
     for (k = 0; k < NUM_PAIRS; k++) {
         float welsch = expf(-(r_k[k] * r_k[k]) / (2.0f * sigma_adapt * sigma_adapt));
@@ -248,33 +266,36 @@ static float run_doa_proposed(float mic_data[NUM_MICS][FFT_N]) {
         if (fabsf(delta_ang) < 1e-3f) break;
     }
     
+    // 【修复缩进报错】
     float final_ang = fmodf(current_ang + 180.0f, 360.0f);
-    if (final_ang < 0) final_ang += 360.0f; return final_ang - 180.0f;
+    if (final_ang < 0) {
+        final_ang += 360.0f;
+    }
+    return final_ang - 180.0f;
 }
 
 // --- 算法 3：SRP-PHAT ---
-static float run_doa_srp(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N], mic_imag[NUM_MICS][FFT_N];
+static float run_doa_srp(float raw_data[NUM_MICS][FFT_N]) {
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
-            mic_real[m][i] = mic_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
-            mic_imag[m][i] = 0.0f;
+            shared_mic_real[m][i] = raw_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
+            shared_mic_imag[m][i] = 0.0f;
         }
-        fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
+        fft_radix2(shared_mic_real[m], shared_mic_imag[m], FFT_N, 0);
     }
     
     float df = SAMPLE_RATE / FFT_N;  
     int start_bin = (int)ceilf(50.0f / df), end_bin = (int)floorf(8000.0f / df);   
 
-    static float R_phat_r[NUM_PAIRS][FFT_N / 2], R_phat_i[NUM_PAIRS][FFT_N / 2];
     int k = 0;
     for (int u = 0; u < NUM_MICS; u++) {
         for (int v = u + 1; v < NUM_MICS; v++) {
             for (int bin = start_bin; bin <= end_bin; bin++) {
-                float cross_r = mic_real[u][bin] * mic_real[v][bin] + mic_imag[u][bin] * mic_imag[v][bin];
-                float cross_i = mic_imag[u][bin] * mic_real[v][bin] - mic_real[u][bin] * mic_imag[v][bin];
+                float cross_r = shared_mic_real[u][bin] * shared_mic_real[v][bin] + shared_mic_imag[u][bin] * shared_mic_imag[v][bin];
+                float cross_i = shared_mic_imag[u][bin] * shared_mic_real[v][bin] - shared_mic_real[u][bin] * shared_mic_imag[v][bin];
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
-                R_phat_r[k][bin] = cross_r / mag; R_phat_i[k][bin] = cross_i / mag;
+                srp_R_phat_r[k][bin] = cross_r / mag; 
+                srp_R_phat_i[k][bin] = cross_i / mag;
             }
             k++;
         }
@@ -287,25 +308,29 @@ static float run_doa_srp(float mic_data[NUM_MICS][FFT_N]) {
             float theo_tdoa = (pair_conf[p].dx * cos_t + pair_conf[p].dy * sin_t) / SOUND_SPEED;
             for (int bin = start_bin; bin <= end_bin; bin++) {
                 float phase = (2.0f * PI * bin * df) * theo_tdoa;
-                e_sum += (R_phat_r[p][bin] * cosf(phase) + R_phat_i[p][bin] * sinf(phase));
+                e_sum += (srp_R_phat_r[p][bin] * cosf(phase) + srp_R_phat_i[p][bin] * sinf(phase));
             }
         }
         if (e_sum > max_srp_energy) { max_srp_energy = e_sum; best_ang = (float)theta; }
     }
+    
+    // 【修复缩进报错】
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
-    if (final_ang < 0) final_ang += 360.0f; return final_ang - 180.0f;
+    if (final_ang < 0) {
+        final_ang += 360.0f;
+    }
+    return final_ang - 180.0f;
 }
 
-// --- 算法 4：Broadband MUSIC (强制计算版) ---
+// --- 算法 4：Broadband MUSIC (无作弊强制满载计算版) ---
 #define MAX_BINS 200
-static float run_doa_music(float mic_data[NUM_MICS][FFT_N]) {
-    static float mic_real[NUM_MICS][FFT_N], mic_imag[NUM_MICS][FFT_N];
+static float run_doa_music(float raw_data[NUM_MICS][FFT_N]) {
     for (int m = 0; m < NUM_MICS; m++) {
         for (int i = 0; i < FFT_N; i++) {
-            mic_real[m][i] = mic_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
-            mic_imag[m][i] = 0.0f;
+            shared_mic_real[m][i] = raw_data[m][i] * (0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_N - 1)));
+            shared_mic_imag[m][i] = 0.0f;
         }
-        fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
+        fft_radix2(shared_mic_real[m], shared_mic_imag[m], FFT_N, 0);
     }
     static float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
     static int geom_init = 0;
@@ -320,17 +345,16 @@ static float run_doa_music(float mic_data[NUM_MICS][FFT_N]) {
     static float P_MUSIC[360] = {0};
     for (int i = 0; i < 360; i++) P_MUSIC[i] = 0.0f;
 
-    // 为强制测量时钟开销，假定历史缓存均为当前帧（满载计算）
     for (int bin = start_bin; bin <= end_bin; bin++) {
         float omega = 2.0f * PI * bin * df;
         float Rxx_r[NUM_MICS][NUM_MICS] = {0}, Rxx_i[NUM_MICS][NUM_MICS] = {0};
 
-        // 构造虚拟满载协方差矩阵 (模拟 N_FRAMES=7 时的计算开销)
+        // 模拟协方差计算
         for (int f = 0; f < 7; f++) {
             for (int i = 0; i < NUM_MICS; i++) {
-                float xr = mic_real[i][bin], xi = mic_imag[i][bin];
+                float xr = shared_mic_real[i][bin], xi = shared_mic_imag[i][bin];
                 for (int j = 0; j < NUM_MICS; j++) {
-                    float yr = mic_real[j][bin], yi = mic_imag[j][bin];
+                    float yr = shared_mic_real[j][bin], yi = shared_mic_imag[j][bin];
                     Rxx_r[i][j] += (xr * yr + xi * yi); Rxx_i[i][j] += (xi * yr - xr * yi);
                 }
             }
@@ -339,6 +363,7 @@ static float run_doa_music(float mic_data[NUM_MICS][FFT_N]) {
             for (int j = 0; j < NUM_MICS; j++) { Rxx_r[i][j] /= 7.0f; Rxx_i[i][j] /= 7.0f; }
         }
 
+        // 特征值分解 EVD
         float V_r[NUM_MICS] = {1,1,1,1,1,1,1}, V_i[NUM_MICS] = {0};
         for (int iter = 0; iter < 20; iter++) {
             float V_new_r[NUM_MICS] = {0}, V_new_i[NUM_MICS] = {0}, norm_sq = 0.0f;
@@ -384,13 +409,18 @@ static float run_doa_music(float mic_data[NUM_MICS][FFT_N]) {
     for (int i = 0; i < 360; i++) {
         if (P_MUSIC[i] > max_P) { max_P = P_MUSIC[i]; best_ang = (float)(i - 180); }
     }
+    
+    // 【修复缩进报错】
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
-    if (final_ang < 0) final_ang += 360.0f; return final_ang - 180.0f;
+    if (final_ang < 0) {
+        final_ang += 360.0f;
+    }
+    return final_ang - 180.0f;
 }
 
 
 // ============================================================================
-// 第四部分：MicroPython 底层接口绑定与基准测试管线
+// 第四部分：MicroPython 底层接口绑定与串行基准测试
 // ============================================================================
 
 static int i2s_dma_cb(void *ctx) {
@@ -427,8 +457,7 @@ STATIC mp_obj_t Maix_mic_array_init(size_t n_args, const mp_obj_t *pos_args, mp_
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(Maix_mic_array_init_obj, 0, Maix_mic_array_init);
 
-
-// 【新增核心探针】：硬件级算法开销 Benchmark 测试
+// 【基准测试接口】串行背靠背(Back-to-Back)运行所有算法
 STATIC mp_obj_t Maix_mic_array_get_benchmark(void)
 {
     volatile uint8_t retry = 100;
@@ -436,7 +465,7 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(void)
     if(rx_flag == 0 && retry == 0) { mp_raise_OSError(MP_ETIMEDOUT); return mp_const_false; }
     rx_flag = 0;
 
-    // 获取一帧统一的真实音频数据
+    // 抓取并固化一帧时域数据 (保证四算法对比的绝对公平性)
     for (int i = 0; i < FFT_N; i++) {
         mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16); mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
         mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16); mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
@@ -445,48 +474,49 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(void)
     }
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    uint64_t t0, t1, t2, t3, t4;
+    uint64_t t_start, t_end;
+    float times_ms[4];
 
-    printf("\n--- Starting Hardware Back-to-Back Benchmark ---\n");
+    printf("\n--- Starting Hardware Sequential Benchmark ---\n");
 
-    // 1. 测试 TDOA-Grid
-    t0 = sysctl_get_time_us();
+    // 1. TDOA-Grid
+    t_start = sysctl_get_time_us();
     float ang_grid = run_doa_grid(mic_raw_float);
-    t1 = sysctl_get_time_us();
-    printf("[1] TDOA-Grid  -> Cost: %5.2f ms | Ang: %.1f\n", (t1 - t0) / 1000.0f, ang_grid);
+    t_end = sysctl_get_time_us();
+    times_ms[0] = (t_end - t_start) / 1000.0f;
+    printf("[1] TDOA-Grid  -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[0], ang_grid);
 
-    // 2. 测试 Proposed (MAD + IRLS)
-    t1 = sysctl_get_time_us();
+    // 2. Proposed (MAD + IRLS)
+    t_start = sysctl_get_time_us();
     float ang_prop = run_doa_proposed(mic_raw_float);
-    t2 = sysctl_get_time_us();
-    printf("[2] Proposed   -> Cost: %5.2f ms | Ang: %.1f\n", (t2 - t1) / 1000.0f, ang_prop);
+    t_end = sysctl_get_time_us();
+    times_ms[1] = (t_end - t_start) / 1000.0f;
+    printf("[2] Proposed   -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[1], ang_prop);
 
-    // 3. 测试 SRP-PHAT
-    t2 = sysctl_get_time_us();
+    // 3. SRP-PHAT
+    t_start = sysctl_get_time_us();
     float ang_srp = run_doa_srp(mic_raw_float);
-    t3 = sysctl_get_time_us();
-    printf("[3] SRP-PHAT   -> Cost: %5.2f ms | Ang: %.1f\n", (t3 - t2) / 1000.0f, ang_srp);
+    t_end = sysctl_get_time_us();
+    times_ms[2] = (t_end - t_start) / 1000.0f;
+    printf("[3] SRP-PHAT   -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[2], ang_srp);
 
-    // 4. 测试 Broadband MUSIC
-    t3 = sysctl_get_time_us();
+    // 4. Broadband MUSIC
+    t_start = sysctl_get_time_us();
     float ang_music = run_doa_music(mic_raw_float);
-    t4 = sysctl_get_time_us();
-    printf("[4] B-MUSIC    -> Cost: %5.2f ms | Ang: %.1f\n", (t4 - t3) / 1000.0f, ang_music);
+    t_end = sysctl_get_time_us();
+    times_ms[3] = (t_end - t_start) / 1000.0f;
+    printf("[4] B-MUSIC    -> Cost: %5.2f ms | Ang: %.1f\n", times_ms[3], ang_music);
 
     printf("------------------------------------------------\n\n");
 
-    // 返回一个元组，包含这四个耗时 (单位：ms) 供 Python 端绘图
     mp_obj_t tuple[4] = {
-        mp_obj_new_float((t1 - t0) / 1000.0f),
-        mp_obj_new_float((t2 - t1) / 1000.0f),
-        mp_obj_new_float((t3 - t2) / 1000.0f),
-        mp_obj_new_float((t4 - t3) / 1000.0f)
+        mp_obj_new_float(times_ms[0]), mp_obj_new_float(times_ms[1]), 
+        mp_obj_new_float(times_ms[2]), mp_obj_new_float(times_ms[3])
     };
     return mp_obj_new_tuple(4, tuple);
 }
 MP_DEFINE_CONST_FUN_OBJ_0(Maix_mic_array_get_benchmark_obj, Maix_mic_array_get_benchmark);
 
-// 获取默认角度 (直接调用 Proposed)
 STATIC mp_obj_t Maix_mic_array_get_dir(void) {
     volatile uint8_t retry = 100;
     while(rx_flag == 0) { retry--; msleep(1); if(retry == 0) break; }
@@ -527,7 +557,7 @@ STATIC const mp_rom_map_elem_t Maix_mic_array_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&Maix_mic_array_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&Maix_mic_array_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_dir), MP_ROM_PTR(&Maix_mic_array_get_dir_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_benchmark), MP_ROM_PTR(&Maix_mic_array_get_benchmark_obj) }, // 绑定探针接口
+    { MP_ROM_QSTR(MP_QSTR_get_benchmark), MP_ROM_PTR(&Maix_mic_array_get_benchmark_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_led), MP_ROM_PTR(&Maix_mic_array_set_led_obj) },
 };
 

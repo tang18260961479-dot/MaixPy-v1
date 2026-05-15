@@ -28,13 +28,13 @@
 #define PLL2_OUTPUT_FREQ 45158400UL
 
 // ============================================================================
-// 第一部分：算法的核心宏定义、结构体与全局变量
+// 第一部分：M-估计 DOA 算法的核心宏定义、结构体与全局变量
 // ============================================================================
 
 #define FFT_N 1024
 #define NUM_MICS 7
 #define NUM_PAIRS 21
-#define SAMPLE_RATE 48000.0f  // 严格保留 48kHz
+#define SAMPLE_RATE 48000.0f
 #define SOUND_SPEED 343.0f
 #undef PI
 #define PI 3.14159265358979323846f
@@ -49,7 +49,7 @@ typedef struct {
 } MicPairConf;
 
 MicPairConf pair_conf[NUM_PAIRS];
-float D_max = 0.08f; 
+float D_max = 0.08f; // 阵列最大物理孔径 (2.3节引入的归一化基准)
 
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
@@ -64,9 +64,8 @@ static void init_array_geometry(void) {
     float theta_mic[6] = {0, 60, 120, 180, 240, 300};
     float mic_pos_2d[NUM_MICS][2];
     int i, j, k;
-    float max_d = 0.0f; // 变量声明全部置顶
+    float max_d = 0.0f;
 
-    // 麦克风 2D 坐标初始化
     for(i = 0; i < 6; i++) {
         mic_pos_2d[i][0] = R * cosf(theta_mic[i] * DEG2RAD);
         mic_pos_2d[i][1] = R * sinf(theta_mic[i] * DEG2RAD);
@@ -86,7 +85,7 @@ static void init_array_geometry(void) {
             k++;
         }
     }
-    D_max = max_d;
+    D_max = max_d; // 自动推导最大孔径，通常为 0.08m
 }
 
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
@@ -129,35 +128,57 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     }
 }
 
-// 论文核心算法管线: MCC-TDOA (固定核宽最大相关熵)
+static float calculate_median(float* array, int size) {
+    float temp[NUM_PAIRS];
+    int i, j;
+    float swap;
+
+    for(i = 0; i < size; i++) temp[i] = array[i];
+    for (i = 0; i < size - 1; i++) {
+        for (j = 0; j < size - i - 1; j++) {
+            if (temp[j] > temp[j + 1]) {
+                swap = temp[j]; 
+                temp[j] = temp[j + 1]; 
+                temp[j + 1] = swap;
+            }
+        }
+    }
+    return temp[size / 2]; // 返回中位数 (MAD)
+}
+
+// 论文 2.1-2.4 节核心算法管线: 本文 Proposed
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
-    // 静态内存池，避免撑爆栈
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_real[FFT_N], R_imag[FFT_N];
     static float s_last_valid_angle = 0.0f;
     static int s_doa_initialized = 0;
     
-    // ==========================================
-    // C89 严格规范：所有变量严格置顶声明
-    // ==========================================
-    int m, i, u, v, k, iter, theta;
+    // C89严格规范：所有变量声明置于最顶部
+    int m, i, u, v, k, theta, iter;
     int search_range, max_idx, valid_count;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float min_cost, ang_coarse, current_ang;
-    float cost, cos_t, sin_t, theo_tdoa, err, r_k_val, w_consist, W_k, J_k;
-    float H, G, delta_ang;
-    float sigma_mcc; // MCC 固定带宽核参数
+    float min_cost, ang_coarse, cos_t, sin_t, cost, theo_tdoa, err;
+    float welsch, norm_geom, delta_ang;
     
-    float tau_meas[NUM_PAIRS];    
-    float Q_k[NUM_PAIRS];
+    float Q_k[NUM_PAIRS];        // 2.2 质量得分
+    float tau_meas[NUM_PAIRS];   // 2.1 测量 TDOA
+    float r_k[NUM_PAIRS];        // 2.3 物理空间残差
+    float W_k[NUM_PAIRS];        // 2.3 综合寻优权重
+    float MAD, sigma_adapt, C_score; 
+    float J_k, H, G; 
+    float current_ang;
     
-    // 手动初始化数组
+    float SAFE_LOWER_BOUND = 0.15f; 
+
+    // 初始化数组以符合 C89 保守规范
     for(k = 0; k < NUM_PAIRS; k++) {
-        tau_meas[k] = 0.0f;
         Q_k[k] = 0.0f;
+        tau_meas[k] = 0.0f;
+        r_k[k] = 0.0f;
+        W_k[k] = 0.0f;
     }
-    
+
     // 1. 特征提取 (加窗与正向 FFT)
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
@@ -168,7 +189,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 2. GCC-PHAT 互相关提取 (严格保留 search_range = 8)
+    // 2. 论文 2.1 节: GCC-PHAT 与 Sigmoid 质量得分提取
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
@@ -183,7 +204,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
             max_val = 0; 
             max_idx = 0;
-            search_range = 8; // 参数未动
+            search_range = 8; // 严格控制变量不变
             for (i = 0; i <= search_range; i++) {
                 if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
             }
@@ -203,18 +224,15 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
             tau_meas[k] = tau_samples / SAMPLE_RATE; 
             
-            // 提取质量得分 Q_k (Sigmoid)
             Q_k[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
             k++;
         }
     }
 
-    // =========================================================
-    // 3. [强健锚点提取] 基于 L1 范数的稳健粗搜
-    // =========================================================
+    // 3. 论文 2.2 节: 质量与几何感知的空间粗搜
     min_cost = FLT_MAX;
     ang_coarse = 0.0f;
-    for (theta = -180; theta < 180; theta += 1) {
+    for (theta = -180; theta < 180; theta += 1) { 
         cost = 0.0f;
         cos_t = cosf(theta * DEG2RAD);
         sin_t = sinf(theta * DEG2RAD);
@@ -222,21 +240,49 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             if (Q_k[k] < 1e-3f) continue;
             theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
             err = theo_tdoa - tau_meas[k];
-            // L1绝对值距离，防止大野值导致平方项爆炸
+            
+            // 【核心修正 BUG】: 从 L2(err*err) 改为 L1 绝对值距离，防止大野值导致的平方项爆炸
             cost += Q_k[k] * sqrtf(pair_conf[k].dist / D_max) * fabsf(err);
         }
         if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
     }
 
-    // =========================================================
-    // 4. MCC-TDOA 信息论最大相关熵 精调模块
-    // =========================================================
-    current_ang = ang_coarse;
+    // 4. 论文 2.3 节: 基于 MAD 理论的自适应 M-估计机制
+    cos_t = cosf(ang_coarse * DEG2RAD);
+    sin_t = sinf(ang_coarse * DEG2RAD);
+    for (k = 0; k < NUM_PAIRS; k++) {
+        theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+        r_k[k] = SOUND_SPEED * fabsf(tau_meas[k] - theo_tdoa); 
+    }
     
-    // MCC 的核心：固定带宽 (Fixed Kernel Width)
-    // 设定容忍 5cm 的物理偏差界限
-    sigma_mcc = 0.05f / SOUND_SPEED; 
+    // 提取空间残差的中位数
+    MAD = calculate_median(r_k, NUM_PAIRS);
+    
+    // 自适应尺度参数 sigma_adapt = 1.5 * MAD
+    sigma_adapt = MAD * 1.5f;
+    
+    // 物理孔径安全边界约束 [0.015m, 0.10m]
+    if (sigma_adapt < 0.015f) sigma_adapt = 0.015f;
+    if (sigma_adapt > 0.10f) sigma_adapt = 0.10f;
 
+    // 构建综合寻优权重 W_k
+    C_score = 0.0f;
+    for (k = 0; k < NUM_PAIRS; k++) {
+        welsch = expf(-(r_k[k] * r_k[k]) / (2.0f * sigma_adapt * sigma_adapt));
+        norm_geom = sqrtf(pair_conf[k].dist / D_max);
+        
+        W_k[k] = Q_k[k] * ((1.0f - 0.2f) * welsch + 0.2f) * norm_geom;
+        C_score += W_k[k];
+    }
+    C_score /= NUM_PAIRS;
+
+    // 抵抗相关性野值雪崩的最后一道防线
+    if (C_score < SAFE_LOWER_BOUND && s_doa_initialized) {
+        return s_last_valid_angle; 
+    }
+
+    // 5. 论文 2.4 节: IRLS 连续域标量寻优
+    current_ang = ang_coarse;
     for (iter = 0; iter < 8; iter++) {
         H = 0.0f;
         G = 0.0f;
@@ -246,39 +292,26 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         sin_t = sinf(current_ang * DEG2RAD);
         
         for (k = 0; k < NUM_PAIRS; k++) {
-            if (Q_k[k] < 1e-4f) continue;
-
+            if (W_k[k] < 1e-4f) continue;
+            valid_count++;
+            
             theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
-            r_k_val = theo_tdoa - tau_meas[k];
-            
-            // --- MCC 核心权重分配逻辑 ---
-            // 使用指数高斯核函数分配平滑非凸权重
-            w_consist = expf(-(r_k_val * r_k_val) / (2.0f * sigma_mcc * sigma_mcc));
-            
-            // 融合前端质量得分 Q_k 与空间孔径归一化权重
-            W_k = Q_k[k] * w_consist * sqrtf(pair_conf[k].dist / D_max);
-            if (W_k > 0) valid_count++;
-            
-            // 计算 Jacobian (偏导数)
             J_k = DEG2RAD * (-pair_conf[k].dx * sin_t + pair_conf[k].dy * cos_t) / SOUND_SPEED;
             
-            // 累加 Hessian 和 Gradient
-            H += W_k * J_k * J_k;
-            G += W_k * J_k * r_k_val;
+            H += W_k[k] * J_k * J_k;
+            G += W_k[k] * J_k * (theo_tdoa - tau_meas[k]);
         }
-        
         if (valid_count < 3) break;
         
-        H += 1e-12f; // 吉洪诺夫正则化，防止矩阵奇异
+        H += 1e-12f; 
         
-        // 高斯-牛顿更新步长
         delta_ang = -G / H;
         current_ang += delta_ang;
         
-        if (fabsf(delta_ang) < 1e-3f) break; // 收敛
+        if (fabsf(delta_ang) < 1e-3f) break; 
     }
-
-    // 5. 解析输出角度与卷绕规约
+    
+    // 角度卷绕规约
     current_ang = fmodf(current_ang + 180.0f, 360.0f);
     if (current_ang < 0) current_ang += 360.0f;
     current_ang -= 180.0f;
@@ -290,7 +323,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 }
 
 // ============================================================================
-// 第三部分：MicroPython 底层接口绑定 
+// 第三部分：MicroPython 底层接口绑定
 // ============================================================================
 
 static int i2s_dma_cb(void *ctx) {
@@ -379,9 +412,7 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
     }
     rx_flag = 0;
 
-    // ===================================================================
-    // ★ 核心修复：对齐 24 位高保真音频数据 (保留符号位) ★
-    // ===================================================================
+    // 【核心修正 BUG】: 对齐 24 位高保真音频数据，算术右移 8 位保留完整动态范围
     for (i = 0; i < FFT_N; i++) {
         mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 8);
         mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 8);
@@ -394,7 +425,6 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
 
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 运行 MCC-TDOA 流水线
     final_angle = run_doa_pipeline(mic_raw_float);
 
     return mp_obj_new_float(final_angle);

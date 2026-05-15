@@ -51,10 +51,6 @@ typedef struct {
 MicPairConf pair_conf[NUM_PAIRS];
 float D_max = 0.08f; 
 
-// --- ADMM L1-TDOA 专用全局预计算矩阵 ---
-float A_admm[NUM_PAIRS][2];
-float AtA_inv_At[2][NUM_PAIRS];
-
 STATIC volatile uint8_t rx_flag = 0;
 int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 float mic_raw_float[NUM_MICS][FFT_N];
@@ -69,6 +65,7 @@ static void init_array_geometry(void) {
     float mic_pos_2d[NUM_MICS][2];
     int i, j, k;
 
+    // 麦克风 2D 坐标初始化
     for(i = 0; i < 6; i++) {
         mic_pos_2d[i][0] = R * cosf(theta_mic[i] * DEG2RAD);
         mic_pos_2d[i][1] = R * sinf(theta_mic[i] * DEG2RAD);
@@ -90,35 +87,6 @@ static void init_array_geometry(void) {
         }
     }
     D_max = max_d;
-
-    // =========================================================
-    // ★ ADMM 算法: 预计算矩阵伪逆 (避免在运行期求逆占用算力) ★
-    // =========================================================
-    for(k = 0; k < NUM_PAIRS; k++) {
-        A_admm[k][0] = pair_conf[k].dx / SOUND_SPEED;
-        A_admm[k][1] = pair_conf[k].dy / SOUND_SPEED;
-    }
-
-    float AtA[2][2] = {0};
-    for(k = 0; k < NUM_PAIRS; k++) {
-        AtA[0][0] += A_admm[k][0] * A_admm[k][0];
-        AtA[0][1] += A_admm[k][0] * A_admm[k][1];
-        AtA[1][0] += A_admm[k][1] * A_admm[k][0];
-        AtA[1][1] += A_admm[k][1] * A_admm[k][1];
-    }
-
-    float det = AtA[0][0] * AtA[1][1] - AtA[0][1] * AtA[1][0];
-    float inv_AtA[2][2];
-    inv_AtA[0][0] =  AtA[1][1] / det;
-    inv_AtA[0][1] = -AtA[0][1] / det;
-    inv_AtA[1][0] = -AtA[1][0] / det;
-    inv_AtA[1][1] =  AtA[0][0] / det;
-
-    for(i = 0; i < 2; i++) {
-        for(k = 0; k < NUM_PAIRS; k++) {
-            AtA_inv_At[i][k] = inv_AtA[i][0] * A_admm[k][0] + inv_AtA[i][1] * A_admm[k][1];
-        }
-    }
 }
 
 static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
@@ -161,7 +129,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     }
 }
 
-// 论文核心算法管线: 替换为 ADMM L1-TDOA
+// 论文核心算法管线: 替换为 Huber-IRLS TDOA
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
@@ -175,6 +143,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     float current_ang;
     
     float tau_meas[NUM_PAIRS] = {0};    
+    float Q_k[NUM_PAIRS] = {0};
     
     // 1. 特征提取 (加窗与正向 FFT)
     for (m = 0; m < NUM_MICS; m++) {
@@ -201,7 +170,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
             max_val = 0; 
             max_idx = 0;
-            search_range = 8; // 严格保留你的参数配置不变
+            search_range = 8; // 严格保留参数配置不变
             for (i = 0; i <= search_range; i++) {
                 if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
             }
@@ -220,48 +189,85 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             
             tau_samples = (max_idx > FFT_N/2) ? (max_idx - FFT_N + delta) : (max_idx + delta);
             tau_meas[k] = tau_samples / SAMPLE_RATE; 
+            
+            // 提取质量得分 Q_k (Sigmoid)
+            Q_k[k] = 1.0f / (1.0f + expf(-15.0f * (max_val - 0.15f)));
             k++;
         }
     }
 
     // =========================================================
-    // 3. ADMM L1-TDOA 现代凸优化求解模块
+    // 3. [强健锚点提取] 基于 L1 范数的稳健粗搜
     // =========================================================
-    float x_admm[2] = {0.0f, 0.0f};
-    float z_admm[NUM_PAIRS] = {0};
-    float u_admm[NUM_PAIRS] = {0};
-    float v_admm;
-    float kappa = 1.0f; // ADMM 惩罚参数 rho = 1.0
-
-    for (iter = 0; iter < 15; iter++) {
-        // x-update (利用预计算的伪逆矩阵)
-        x_admm[0] = 0.0f; 
-        x_admm[1] = 0.0f;
+    float min_cost = FLT_MAX;
+    float ang_coarse = 0.0f;
+    for (int theta = -180; theta < 180; theta += 1) {
+        float cost = 0.0f;
+        float cos_t = cosf(theta * DEG2RAD);
+        float sin_t = sinf(theta * DEG2RAD);
         for (k = 0; k < NUM_PAIRS; k++) {
-            float term = z_admm[k] + tau_meas[k] - u_admm[k];
-            x_admm[0] += AtA_inv_At[0][k] * term;
-            x_admm[1] += AtA_inv_At[1][k] * term;
+            if (Q_k[k] < 1e-3f) continue;
+            float theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+            float err = theo_tdoa - tau_meas[k];
+            // L1绝对值距离，防止大野值导致平方项爆炸
+            cost += Q_k[k] * sqrtf(pair_conf[k].dist / D_max) * fabsf(err);
         }
-
-        // v-update, z-update (软阈值) & u-update
-        for (k = 0; k < NUM_PAIRS; k++) {
-            v_admm = A_admm[k][0] * x_admm[0] + A_admm[k][1] * x_admm[1] - tau_meas[k] + u_admm[k];
-            
-            float abs_v = fabsf(v_admm);
-            if (abs_v > kappa) {
-                z_admm[k] = (v_admm > 0) ? (abs_v - kappa) : -(abs_v - kappa);
-            } else {
-                z_admm[k] = 0.0f;
-            }
-
-            u_admm[k] = v_admm - z_admm[k];
-        }
+        if (cost < min_cost) { min_cost = cost; ang_coarse = (float)theta; }
     }
 
-    // 4. 解析目标角度
-    current_ang = atan2f(x_admm[1], x_admm[0]) * (180.0f / PI);
-    
-    // 角度卷绕规约
+    // =========================================================
+    // 4. Huber-IRLS TDOA 传统凸平滑 M-估计 精调模块
+    // =========================================================
+    current_ang = ang_coarse;
+    float delta_huber = 0.05f / SOUND_SPEED; // Huber 物理阈值：0.05米
+
+    for (iter = 0; iter < 8; iter++) {
+        float H = 0.0f;
+        float G = 0.0f;
+        int valid_count = 0;
+        
+        float cos_t = cosf(current_ang * DEG2RAD);
+        float sin_t = sinf(current_ang * DEG2RAD);
+        
+        for (k = 0; k < NUM_PAIRS; k++) {
+            if (Q_k[k] < 1e-4f) continue;
+
+            float theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+            float r_k = theo_tdoa - tau_meas[k];
+            float abs_r = fabsf(r_k);
+            
+            // --- Huber 核心权重分配逻辑 ---
+            float w_consist;
+            if (abs_r <= delta_huber) {
+                w_consist = 1.0f; // 内点区域：等同于普通最小二乘 (L2)
+            } else {
+                w_consist = delta_huber / abs_r; // 外点区域：权重呈线性衰减 (L1)
+            }
+            
+            // 融合前端质量得分 Q_k 与空间孔径归一化权重
+            float W_k = Q_k[k] * w_consist * sqrtf(pair_conf[k].dist / D_max);
+            if (W_k > 0) valid_count++;
+            
+            // 计算 Jacobian (偏导数)
+            float J_k = DEG2RAD * (-pair_conf[k].dx * sin_t + pair_conf[k].dy * cos_t) / SOUND_SPEED;
+            
+            // 累加 Hessian 和 Gradient
+            H += W_k * J_k * J_k;
+            G += W_k * J_k * r_k;
+        }
+        
+        if (valid_count < 3) break;
+        
+        H += 1e-12f; // 吉洪诺夫正则化，防止矩阵奇异
+        
+        // 高斯-牛顿更新步长
+        float delta_ang = -G / H;
+        current_ang += delta_ang;
+        
+        if (fabsf(delta_ang) < 1e-3f) break; // 收敛
+    }
+
+    // 5. 解析输出角度与卷绕规约
     current_ang = fmodf(current_ang + 180.0f, 360.0f);
     if (current_ang < 0) current_ang += 360.0f;
     current_ang -= 180.0f;
@@ -379,7 +385,7 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
 
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 运行 ADMM L1-TDOA 流水线
+    // 运行 Huber-IRLS TDOA 流水线
     final_angle = run_doa_pipeline(mic_raw_float);
 
     return mp_obj_new_float(final_angle);

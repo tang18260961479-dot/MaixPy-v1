@@ -56,7 +56,7 @@ int32_t i2s_rx_buf[FFT_N * 8] __attribute__((aligned(128)));
 float mic_raw_float[NUM_MICS][FFT_N];
 
 // ============================================================================
-// 第二部分：纯 C 语言硬核数学与信号处理管线
+// 第二部分：纯 C 语言硬核数学与信号处理管线 (C89 严格规范化)
 // ============================================================================
 
 static void init_array_geometry(void) {
@@ -64,6 +64,7 @@ static void init_array_geometry(void) {
     float theta_mic[6] = {0, 60, 120, 180, 240, 300};
     float mic_pos_2d[NUM_MICS][2];
     int i, j, k;
+    float max_d = 0.0f; // 变量声明全部置顶
 
     // 麦克风 2D 坐标初始化
     for(i = 0; i < 6; i++) {
@@ -74,7 +75,6 @@ static void init_array_geometry(void) {
     mic_pos_2d[6][1] = 0.0f;
 
     k = 0;
-    float max_d = 0.0f;
     for (i = 0; i < NUM_MICS; i++) {
         for (j = i + 1; j < NUM_MICS; j++) {
             pair_conf[k].u = i; 
@@ -129,21 +129,33 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     }
 }
 
-// 论文核心算法管线: 替换为 Huber-IRLS TDOA
+// 论文核心算法管线: Huber-IRLS TDOA 
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
+    // 静态内存池，避免撑爆栈
     static float mic_real[NUM_MICS][FFT_N]; 
     static float mic_imag[NUM_MICS][FFT_N]; 
     static float R_real[FFT_N], R_imag[FFT_N];
     static float s_last_valid_angle = 0.0f;
     static int s_doa_initialized = 0;
     
-    int m, i, u, v, k, iter;
-    int search_range, max_idx;
+    // ==========================================
+    // 解决编译报错：所有变量严格置顶声明 (C89标准)
+    // ==========================================
+    int m, i, u, v, k, iter, theta;
+    int search_range, max_idx, valid_count;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float current_ang;
+    float min_cost, ang_coarse, current_ang, delta_huber;
+    float cost, cos_t, sin_t, theo_tdoa, err, r_k_val, abs_r, w_consist, W_k, J_k;
+    float H, G, delta_ang;
     
-    float tau_meas[NUM_PAIRS] = {0};    
-    float Q_k[NUM_PAIRS] = {0};
+    float tau_meas[NUM_PAIRS];    
+    float Q_k[NUM_PAIRS];
+    
+    // 手动初始化数组
+    for(k = 0; k < NUM_PAIRS; k++) {
+        tau_meas[k] = 0.0f;
+        Q_k[k] = 0.0f;
+    }
     
     // 1. 特征提取 (加窗与正向 FFT)
     for (m = 0; m < NUM_MICS; m++) {
@@ -155,7 +167,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 2. GCC-PHAT 互相关提取 (严格保留 search_range = 8 设定)
+    // 2. GCC-PHAT 互相关提取 (严格保留 search_range = 8)
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
@@ -170,7 +182,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
             max_val = 0; 
             max_idx = 0;
-            search_range = 8; // 严格保留参数配置不变
+            search_range = 8; // 参数未动
             for (i = 0; i <= search_range; i++) {
                 if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
             }
@@ -199,16 +211,16 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     // =========================================================
     // 3. [强健锚点提取] 基于 L1 范数的稳健粗搜
     // =========================================================
-    float min_cost = FLT_MAX;
-    float ang_coarse = 0.0f;
-    for (int theta = -180; theta < 180; theta += 1) {
-        float cost = 0.0f;
-        float cos_t = cosf(theta * DEG2RAD);
-        float sin_t = sinf(theta * DEG2RAD);
+    min_cost = FLT_MAX;
+    ang_coarse = 0.0f;
+    for (theta = -180; theta < 180; theta += 1) {
+        cost = 0.0f;
+        cos_t = cosf(theta * DEG2RAD);
+        sin_t = sinf(theta * DEG2RAD);
         for (k = 0; k < NUM_PAIRS; k++) {
             if (Q_k[k] < 1e-3f) continue;
-            float theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
-            float err = theo_tdoa - tau_meas[k];
+            theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+            err = theo_tdoa - tau_meas[k];
             // L1绝对值距离，防止大野值导致平方项爆炸
             cost += Q_k[k] * sqrtf(pair_conf[k].dist / D_max) * fabsf(err);
         }
@@ -219,25 +231,24 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     // 4. Huber-IRLS TDOA 传统凸平滑 M-估计 精调模块
     // =========================================================
     current_ang = ang_coarse;
-    float delta_huber = 0.05f / SOUND_SPEED; // Huber 物理阈值：0.05米
+    delta_huber = 0.05f / SOUND_SPEED; // Huber 物理阈值：0.05米
 
     for (iter = 0; iter < 8; iter++) {
-        float H = 0.0f;
-        float G = 0.0f;
-        int valid_count = 0;
+        H = 0.0f;
+        G = 0.0f;
+        valid_count = 0;
         
-        float cos_t = cosf(current_ang * DEG2RAD);
-        float sin_t = sinf(current_ang * DEG2RAD);
+        cos_t = cosf(current_ang * DEG2RAD);
+        sin_t = sinf(current_ang * DEG2RAD);
         
         for (k = 0; k < NUM_PAIRS; k++) {
             if (Q_k[k] < 1e-4f) continue;
 
-            float theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
-            float r_k = theo_tdoa - tau_meas[k];
-            float abs_r = fabsf(r_k);
+            theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
+            r_k_val = theo_tdoa - tau_meas[k];
+            abs_r = fabsf(r_k_val);
             
             // --- Huber 核心权重分配逻辑 ---
-            float w_consist;
             if (abs_r <= delta_huber) {
                 w_consist = 1.0f; // 内点区域：等同于普通最小二乘 (L2)
             } else {
@@ -245,15 +256,15 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
             }
             
             // 融合前端质量得分 Q_k 与空间孔径归一化权重
-            float W_k = Q_k[k] * w_consist * sqrtf(pair_conf[k].dist / D_max);
+            W_k = Q_k[k] * w_consist * sqrtf(pair_conf[k].dist / D_max);
             if (W_k > 0) valid_count++;
             
             // 计算 Jacobian (偏导数)
-            float J_k = DEG2RAD * (-pair_conf[k].dx * sin_t + pair_conf[k].dy * cos_t) / SOUND_SPEED;
+            J_k = DEG2RAD * (-pair_conf[k].dx * sin_t + pair_conf[k].dy * cos_t) / SOUND_SPEED;
             
             // 累加 Hessian 和 Gradient
             H += W_k * J_k * J_k;
-            G += W_k * J_k * r_k;
+            G += W_k * J_k * r_k_val;
         }
         
         if (valid_count < 3) break;
@@ -261,7 +272,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         H += 1e-12f; // 吉洪诺夫正则化，防止矩阵奇异
         
         // 高斯-牛顿更新步长
-        float delta_ang = -G / H;
+        delta_ang = -G / H;
         current_ang += delta_ang;
         
         if (fabsf(delta_ang) < 1e-3f) break; // 收敛
@@ -370,8 +381,6 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
 
     // ===================================================================
     // ★ 核心修复：对齐 24 位高保真音频数据 (保留符号位) ★
-    // I2S 为 32-bit 左对齐格式，真实 24-bit 数据位于 bit[31:8]
-    // 算术右移 8 位 (>> 8)，还原完整的 24 位精度，消除量化底噪
     // ===================================================================
     for (i = 0; i < FFT_N; i++) {
         mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 8);

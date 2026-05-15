@@ -129,7 +129,7 @@ static void fft_radix2(float* real, float* imag, int n, int is_inverse) {
     }
 }
 
-// 论文核心算法管线: Huber-IRLS TDOA 
+// 论文核心算法管线: MCC-TDOA (固定核宽最大相关熵)
 static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     // 静态内存池，避免撑爆栈
     static float mic_real[NUM_MICS][FFT_N]; 
@@ -139,14 +139,15 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     static int s_doa_initialized = 0;
     
     // ==========================================
-    // 解决编译报错：所有变量严格置顶声明 (C89标准)
+    // C89 严格规范：所有变量严格置顶声明
     // ==========================================
     int m, i, u, v, k, iter, theta;
     int search_range, max_idx, valid_count;
     float window, cross_r, cross_i, mag, max_val, delta, y1, y2, y3, denom, tau_samples;
-    float min_cost, ang_coarse, current_ang, delta_huber;
-    float cost, cos_t, sin_t, theo_tdoa, err, r_k_val, abs_r, w_consist, W_k, J_k;
+    float min_cost, ang_coarse, current_ang;
+    float cost, cos_t, sin_t, theo_tdoa, err, r_k_val, w_consist, W_k, J_k;
     float H, G, delta_ang;
+    float sigma_mcc; // MCC 固定带宽核参数
     
     float tau_meas[NUM_PAIRS];    
     float Q_k[NUM_PAIRS];
@@ -228,10 +229,13 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
     }
 
     // =========================================================
-    // 4. Huber-IRLS TDOA 传统凸平滑 M-估计 精调模块
+    // 4. MCC-TDOA 信息论最大相关熵 精调模块
     // =========================================================
     current_ang = ang_coarse;
-    delta_huber = 0.05f / SOUND_SPEED; // Huber 物理阈值：0.05米
+    
+    // MCC 的核心：固定带宽 (Fixed Kernel Width)
+    // 设定容忍 5cm 的物理偏差界限
+    sigma_mcc = 0.05f / SOUND_SPEED; 
 
     for (iter = 0; iter < 8; iter++) {
         H = 0.0f;
@@ -246,14 +250,10 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
             theo_tdoa = (pair_conf[k].dx * cos_t + pair_conf[k].dy * sin_t) / SOUND_SPEED;
             r_k_val = theo_tdoa - tau_meas[k];
-            abs_r = fabsf(r_k_val);
             
-            // --- Huber 核心权重分配逻辑 ---
-            if (abs_r <= delta_huber) {
-                w_consist = 1.0f; // 内点区域：等同于普通最小二乘 (L2)
-            } else {
-                w_consist = delta_huber / abs_r; // 外点区域：权重呈线性衰减 (L1)
-            }
+            // --- MCC 核心权重分配逻辑 ---
+            // 使用指数高斯核函数分配平滑非凸权重
+            w_consist = expf(-(r_k_val * r_k_val) / (2.0f * sigma_mcc * sigma_mcc));
             
             // 融合前端质量得分 Q_k 与空间孔径归一化权重
             W_k = Q_k[k] * w_consist * sqrtf(pair_conf[k].dist / D_max);
@@ -394,7 +394,7 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
 
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
-    // 运行 Huber-IRLS TDOA 流水线
+    // 运行 MCC-TDOA 流水线
     final_angle = run_doa_pipeline(mic_raw_float);
 
     return mp_obj_new_float(final_angle);

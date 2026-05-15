@@ -34,7 +34,7 @@
 #define FFT_N 1024
 #define NUM_MICS 7
 #define NUM_PAIRS 21
-#define SAMPLE_RATE 48000.0f
+#define SAMPLE_RATE 48000.0f  // 严格保留 48kHz
 #define SOUND_SPEED 343.0f
 #undef PI
 #define PI 3.14159265358979323846f
@@ -186,7 +186,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         fft_radix2(mic_real[m], mic_imag[m], FFT_N, 0);
     }
 
-    // 2. GCC-PHAT 互相关提取 (严格保留你的 search_range = 8 设定)
+    // 2. GCC-PHAT 互相关提取 (严格保留 search_range = 8 设定)
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
         for (v = u + 1; v < NUM_MICS; v++) {
@@ -201,7 +201,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 
             max_val = 0; 
             max_idx = 0;
-            search_range = 8; // 严格保留你的参数配置
+            search_range = 8; // 严格保留你的参数配置不变
             for (i = 0; i <= search_range; i++) {
                 if (R_real[i] > max_val) { max_val = R_real[i]; max_idx = i; }
             }
@@ -273,7 +273,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
 }
 
 // ============================================================================
-// 第三部分：MicroPython 底层接口绑定
+// 第三部分：MicroPython 底层接口绑定 
 // ============================================================================
 
 static int i2s_dma_cb(void *ctx) {
@@ -362,18 +362,24 @@ STATIC mp_obj_t Maix_mic_array_get_dir(void)
     }
     rx_flag = 0;
 
+    // ===================================================================
+    // ★ 核心修复：对齐 24 位高保真音频数据 (保留符号位) ★
+    // I2S 为 32-bit 左对齐格式，真实 24-bit 数据位于 bit[31:8]
+    // 算术右移 8 位 (>> 8)，还原完整的 24 位精度，消除量化底噪
+    // ===================================================================
     for (i = 0; i < FFT_N; i++) {
-        mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 16);
-        mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 16);
-        mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 16);
-        mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 16);
-        mic_raw_float[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 16);
-        mic_raw_float[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 16);
-        mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 16);
+        mic_raw_float[0][i] = (float)(i2s_rx_buf[i*8 + 0] >> 8);
+        mic_raw_float[1][i] = (float)(i2s_rx_buf[i*8 + 1] >> 8);
+        mic_raw_float[2][i] = (float)(i2s_rx_buf[i*8 + 2] >> 8);
+        mic_raw_float[3][i] = (float)(i2s_rx_buf[i*8 + 3] >> 8);
+        mic_raw_float[4][i] = (float)(i2s_rx_buf[i*8 + 4] >> 8);
+        mic_raw_float[5][i] = (float)(i2s_rx_buf[i*8 + 5] >> 8);
+        mic_raw_float[6][i] = (float)(i2s_rx_buf[i*8 + 6] >> 8);
     }
 
     i2s_receive_data_dma(I2S_DEVICE_0, (uint32_t *)i2s_rx_buf, FFT_N * 8, DMAC_CHANNEL4);
 
+    // 运行 ADMM L1-TDOA 流水线
     final_angle = run_doa_pipeline(mic_raw_float);
 
     return mp_obj_new_float(final_angle);

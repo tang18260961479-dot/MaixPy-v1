@@ -1,4 +1,4 @@
-#include <stdio.h>
+ #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <float.h>
@@ -271,7 +271,7 @@ static float run_doa_pipeline(float mic_data[NUM_MICS][FFT_N]) {
         welsch = expf(-(r_k[k] * r_k[k]) / (2.0f * sigma_adapt * sigma_adapt));
         norm_geom = sqrtf(pair_conf[k].dist / D_max);
         
-        W_k[k] = Q_k[k] * ((1.0f - 0.2f) * welsch + 0.2f) * norm_geom;
+        W_k[k] = Q_k[k] * ((1.0f - 0.05f) * welsch + 0.05f) * norm_geom;
         C_score += W_k[k];
     }
     C_score /= NUM_PAIRS;

@@ -88,57 +88,74 @@ static float music_pos_y[NUM_MICS];
 static int music_geom_init = 0;
 
 // ============================================================================
-// 内存统计口径说明
+// 内存统计口径说明（论文横向对比版）
 // ============================================================================
 // Python 接口仍保持原来的 4 元组：cost_ms, macs, ram_kb, angle。
-// 这里的 ram_kb 统一解释为：
-//   “单个算法独立部署时，完成一帧 DOA 估计所需的完整峰值 RAM”。
 //
-// 统计原则：
-// 1) 每个算法都计入真实采集帧、7路原始浮点帧、FFT复用缓存，这是上板实时处理必需开销。
-// 2) TDOA-Grid、ADMM、Huber、MCC、Proposed 都依赖 GCC-PHAT/TDOA 测量，
-//    因此都计入 shared_R_real/shared_R_imag 这组互相关 IFFT 复用缓存。
-// 3) SRP-PHAT 不做“先求 TDOA 再定位”，但它需要保存各麦克风对的 PHAT 频域互谱，
-//    因此计入 srp_R_phat_r/srp_R_phat_i，而不额外计入 GCC IFFT 缓存。
-// 4) Broadband MUSIC 不需要互相关/TDOA 缓存，只计入多帧频域历史、协方差/投影矩阵和谱搜索缓存。
-// 5) 不把 7 合 1 测试固件中“其他算法的专属 static 缓存”算入当前算法，避免互相污染。
+// 这里的 ram_kb 默认解释为：
+//   “算法完成一帧 DOA 估计所需的计算工作区 RAM”
 //
-// 说明：如果要测“整个 7 合 1 固件实际占用 SRAM”，应查看链接 map 文件；
-//      如果要做论文中的算法横向对比，应使用这里返回的 ram_kb。
+// 这个口径用于论文横向对比，更接近你原始代码/仿真中的内存定义：
+// 1) 不默认计入 I2S DMA 接收缓存、mic_raw_float 输入帧缓存；
+// 2) 不默认计入所有算法共用的 7 路 FFT 实/虚部复用缓存；
+// 3) TDOA-Grid、ADMM、Huber、MCC、Proposed 依赖 GCC-PHAT/TDOA 测量，
+//    因此必须计入 shared_R_real/shared_R_imag 这组互相关 IFFT 复用缓存；
+// 4) SRP-PHAT 不走“先求 TDOA 再定位”的流程，因此不计入 GCC IFFT 缓存，
+//    只计入它自己的 PHAT 频域互谱缓存；
+// 5) Broadband MUSIC 不需要互相关/TDOA 缓存，只计入多帧频域历史、谱搜索和矩阵工作区；
+// 6) 不把 7 合 1 测试固件中“其他算法专属 static 缓存”算入当前算法，避免互相污染。
+//
+// 重要说明：
+// - 如果你想统计“整个 7 合 1 固件实际占用 SRAM”，应看链接 map 文件；
+// - 如果你想统计“单算法上板部署总 SRAM”，可以把下面两个宏改为 1；
+// - 论文横向对比建议保持默认 0/0/1，这样不会把固定采集缓存重复算进所有算法。
 #define BENCH_BYTES_TO_KB(x) ((float)(x) / 1024.0f)
 #define BENCH_FLOAT_BYTES(n) ((size_t)(n) * sizeof(float))
 
-// 所有算法都需要：DMA采集帧 + 7路原始浮点帧 + 7路 FFT 实部/虚部复用缓存。
-#define BENCH_BASE_FRONTEND_BYTES ( \
-    sizeof(rx_flag) + sizeof(i2s_rx_buf) + sizeof(mic_raw_float) + \
-    sizeof(shared_mic_real) + sizeof(shared_mic_imag) )
+// ===== 内存口径开关 =====
+// 是否把 I2S DMA 接收缓存和 mic_raw_float 输入帧也计入 RAM_KB。
+// 论文算法复杂度对比建议为 0；整机部署峰值 RAM 评估可改为 1。
+#define BENCH_COUNT_FRAME_IO        0
 
-// 仅 GCC/TDOA 类算法需要的互相关 IFFT 复用缓存。
+// 是否把 7 路 FFT 实部/虚部复用缓存也计入 RAM_KB。
+// 论文算法复杂度对比建议为 0；整机部署峰值 RAM 评估可改为 1。
+#define BENCH_COUNT_SHARED_FFT      0
+
+// TDOA 系列算法是否计入 GCC-PHAT 互相关 IFFT 缓存。
+// 这是你这次明确要求补进去的公共互相关部分，建议保持 1。
+#define BENCH_COUNT_GCC_XCORR       1
+
+#define BENCH_FRAME_IO_BYTES (sizeof(rx_flag) + sizeof(i2s_rx_buf) + sizeof(mic_raw_float))
+#define BENCH_SHARED_FFT_BYTES (sizeof(shared_mic_real) + sizeof(shared_mic_imag))
 #define BENCH_GCC_PAIR_BUFFER_BYTES (sizeof(shared_R_real) + sizeof(shared_R_imag))
-
-// 几何信息也属于算法完整部署开销。TDOA/SRP 系列使用 pair_conf，MUSIC 使用阵元坐标缓存。
 #define BENCH_PAIR_GEOM_BYTES (sizeof(pair_conf) + sizeof(D_max))
 #define BENCH_MUSIC_STATE_BYTES (sizeof(music_frame_idx) + sizeof(music_frames_collected) + \
                                  sizeof(music_last_angle) + sizeof(music_geom_init))
 
-// 这个值只是给注释/调试使用，不作为 Python 接口返回。
-static float bench_base_frontend_ram_kb(void) {
-    return BENCH_BYTES_TO_KB(BENCH_BASE_FRONTEND_BYTES);
-}
+static float bench_algorithm_ram_kb(int algo_id) {
+    size_t bytes = 0;
 
-static float bench_realtime_ram_kb(int algo_id) {
-    size_t bytes = BENCH_BASE_FRONTEND_BYTES;
+#if BENCH_COUNT_FRAME_IO
+    bytes += BENCH_FRAME_IO_BYTES;
+#endif
+
+#if BENCH_COUNT_SHARED_FFT
+    bytes += BENCH_SHARED_FFT_BYTES;
+#endif
 
     switch (algo_id) {
-        case 0: // TDOA-Grid：基础前端 + 阵列几何 + GCC互相关缓存 + TDOA测量向量
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_GCC_PAIR_BUFFER_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS);
+        case 0: // TDOA-Grid：阵列几何 + GCC互相关缓存 + TDOA测量向量
+            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS);
+#if BENCH_COUNT_GCC_XCORR
+            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
+#endif
             break;
 
-        case 1: // SRP-PHAT：基础前端 + 阵列几何 + 紧凑频带 PHAT 互谱缓存
+        case 1: // SRP-PHAT：阵列几何 + 紧凑频带 PHAT 互谱缓存；不计入 GCC IFFT 缓存
             bytes += BENCH_PAIR_GEOM_BYTES + sizeof(srp_R_phat_r) + sizeof(srp_R_phat_i);
             break;
 
-        case 2: // Broadband MUSIC：基础前端 + MUSIC状态 + 多帧频域历史缓存 + 谱缓存 + 矩阵/向量工作区估计
+        case 2: // Broadband MUSIC：MUSIC状态 + 多帧频域历史缓存 + 谱缓存 + 矩阵/向量工作区
             bytes += BENCH_MUSIC_STATE_BYTES +
                      sizeof(X_history_r) + sizeof(X_history_i) +
                      sizeof(music_P_spectrum) + sizeof(music_pos_x) + sizeof(music_pos_y) +
@@ -147,22 +164,34 @@ static float bench_realtime_ram_kb(int algo_id) {
                      BENCH_FLOAT_BYTES(8 * NUM_MICS);               // V、V_new、a、y 等小向量
             break;
 
-        case 3: // ADMM L1-TDOA：基础前端 + 阵列几何 + GCC缓存 + 预计算矩阵 + tau/x/z/u 工作向量
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_GCC_PAIR_BUFFER_BYTES +
+        case 3: // ADMM L1-TDOA：阵列几何 + GCC缓存 + 预计算矩阵 + tau/x/z/u 工作向量
+            bytes += BENCH_PAIR_GEOM_BYTES +
                      sizeof(A_admm) + sizeof(AtA_inv_At) +
                      BENCH_FLOAT_BYTES(NUM_PAIRS + 2 + NUM_PAIRS + NUM_PAIRS);
+#if BENCH_COUNT_GCC_XCORR
+            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
+#endif
             break;
 
-        case 4: // Huber-IRLS：基础前端 + 阵列几何 + GCC缓存 + tau_meas + Q_k
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_GCC_PAIR_BUFFER_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS + NUM_PAIRS);
+        case 4: // Huber-IRLS：阵列几何 + GCC缓存 + tau_meas + Q_k
+            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS + NUM_PAIRS);
+#if BENCH_COUNT_GCC_XCORR
+            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
+#endif
             break;
 
-        case 5: // MCC-TDOA：基础前端 + 阵列几何 + GCC缓存 + tau_meas + Q_k
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_GCC_PAIR_BUFFER_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS + NUM_PAIRS);
+        case 5: // MCC-TDOA：阵列几何 + GCC缓存 + tau_meas + Q_k
+            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS + NUM_PAIRS);
+#if BENCH_COUNT_GCC_XCORR
+            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
+#endif
             break;
 
-        case 6: // Proposed(MAD)：基础前端 + 阵列几何 + GCC缓存 + Q、tau、残差、权重 + 中位数临时数组
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_GCC_PAIR_BUFFER_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS * 5);
+        case 6: // Proposed(MAD)：阵列几何 + GCC缓存 + Q、tau、残差、权重 + 中位数临时数组
+            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS * 5);
+#if BENCH_COUNT_GCC_XCORR
+            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
+#endif
             break;
 
         default:
@@ -171,6 +200,13 @@ static float bench_realtime_ram_kb(int algo_id) {
     }
 
     return BENCH_BYTES_TO_KB(bytes);
+}
+
+static float bench_total_deploy_ram_kb(int algo_id) {
+    // 这个函数不作为默认 Python 返回值，只用于你需要“单算法整机部署峰值 RAM”时参考。
+    // 它等价于：输入/采集缓存 + 共享FFT缓存 + 算法工作区。
+    size_t bytes = BENCH_FRAME_IO_BYTES + BENCH_SHARED_FFT_BYTES;
+    return BENCH_BYTES_TO_KB(bytes) + bench_algorithm_ram_kb(algo_id);
 }
 
 // ============================================================================
@@ -964,8 +1000,8 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(mp_obj_t algo_id_obj) {
     float angle_out = 0.0f;
     uint32_t macs_out = 0;
     // 保持原接口不变：第三个返回值仍为 RAM_KB。
-    // 但 RAM_KB 不再手写常数，而是由 sizeof() 统一计算单算法部署时的峰值工作 RAM。
-    float ram_kb_out = bench_realtime_ram_kb(algo_id);
+    // 但 RAM_KB 不再手写常数，而是由 sizeof() 统一计算算法工作区 RAM；TDOA 系列会计入 GCC 互相关缓存。
+    float ram_kb_out = bench_algorithm_ram_kb(algo_id);
 
     // 5. 纯净计算耗时起点
     uint64_t start_time_us = sysctl_get_time_us();

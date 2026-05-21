@@ -57,7 +57,8 @@ float AtA_inv_At[2][NUM_PAIRS];
 
 // --- Broadband MUSIC 专用滑动缓存区 ---
 #define N_FRAMES 7
-#define MAX_BINS 172   // 50~8000 Hz 对应 FFT_N=1024、Fs=48k 时最高 bin≈170；172 预留边界，避免原 200 造成冗余
+#define MAX_BINS 200
+#define SRP_MAX_BINS 172
 static float X_history_r[N_FRAMES][NUM_MICS][MAX_BINS];
 static float X_history_i[N_FRAMES][NUM_MICS][MAX_BINS];
 static int music_frame_idx = 0;
@@ -74,139 +75,63 @@ static float shared_mic_imag[NUM_MICS][FFT_N];
 static float shared_R_real[FFT_N];
 static float shared_R_imag[FFT_N];
 
-// --- 算法私有静态工作区：用于替代函数内部大块临时数组，统一内存口径 ---
-// SRP-PHAT 只使用 50~8000 Hz 频带，对应 bin 约为 2~170。
-// 原代码使用 [NUM_PAIRS][FFT_N/2]，会把 171~511 的无效频点也静态分配出来。
-// 这里改成 [NUM_PAIRS][MAX_BINS]，并用 compact_bin = bin - start_bin 紧凑存储。
-static float srp_R_phat_r[NUM_PAIRS][MAX_BINS];
-static float srp_R_phat_i[NUM_PAIRS][MAX_BINS];
-
-// MUSIC 的谱缓存和阵元坐标也放到静态区，避免每帧在栈上重复申请。
-static float music_P_spectrum[360];
-static float music_pos_x[NUM_MICS];
-static float music_pos_y[NUM_MICS];
-static int music_geom_init = 0;
-
-// ============================================================================
-// 内存统计口径说明（论文横向对比版）
-// ============================================================================
-// Python 接口仍保持原来的 4 元组：cost_ms, macs, ram_kb, angle。
-//
-// 这里的 ram_kb 默认解释为：
-//   “算法完成一帧 DOA 估计所需的计算工作区 RAM”
-//
-// 这个口径用于论文横向对比，更接近你原始代码/仿真中的内存定义：
-// 1) 不默认计入 I2S DMA 接收缓存、mic_raw_float 输入帧缓存；
-// 2) 不默认计入所有算法共用的 7 路 FFT 实/虚部复用缓存；
-// 3) TDOA-Grid、ADMM、Huber、MCC、Proposed 依赖 GCC-PHAT/TDOA 测量，
-//    因此必须计入 shared_R_real/shared_R_imag 这组互相关 IFFT 复用缓存；
-// 4) SRP-PHAT 不走“先求 TDOA 再定位”的流程，因此不计入 GCC IFFT 缓存，
-//    只计入它自己的 PHAT 频域互谱缓存；
-// 5) Broadband MUSIC 不需要互相关/TDOA 缓存，只计入多帧频域历史、谱搜索和矩阵工作区；
-// 6) 不把 7 合 1 测试固件中“其他算法专属 static 缓存”算入当前算法，避免互相污染。
-//
-// 重要说明：
-// - 如果你想统计“整个 7 合 1 固件实际占用 SRAM”，应看链接 map 文件；
-// - 如果你想统计“单算法上板部署总 SRAM”，可以把下面两个宏改为 1；
-// - 论文横向对比建议保持默认 0/0/1，这样不会把固定采集缓存重复算进所有算法。
-#define BENCH_BYTES_TO_KB(x) ((float)(x) / 1024.0f)
-#define BENCH_FLOAT_BYTES(n) ((size_t)(n) * sizeof(float))
-
-// ===== 内存口径开关 =====
-// 是否把 I2S DMA 接收缓存和 mic_raw_float 输入帧也计入 RAM_KB。
-// 论文算法复杂度对比建议为 0；整机部署峰值 RAM 评估可改为 1。
-#define BENCH_COUNT_FRAME_IO        0
-
-// 是否把 7 路 FFT 实部/虚部复用缓存也计入 RAM_KB。
-// 论文算法复杂度对比建议为 0；整机部署峰值 RAM 评估可改为 1。
-#define BENCH_COUNT_SHARED_FFT      0
-
-// TDOA 系列算法是否计入 GCC-PHAT 互相关 IFFT 缓存。
-// 这是你这次明确要求补进去的公共互相关部分，建议保持 1。
-#define BENCH_COUNT_GCC_XCORR       1
-
-#define BENCH_FRAME_IO_BYTES (sizeof(rx_flag) + sizeof(i2s_rx_buf) + sizeof(mic_raw_float))
-#define BENCH_SHARED_FFT_BYTES (sizeof(shared_mic_real) + sizeof(shared_mic_imag))
-#define BENCH_GCC_PAIR_BUFFER_BYTES (sizeof(shared_R_real) + sizeof(shared_R_imag))
-#define BENCH_PAIR_GEOM_BYTES (sizeof(pair_conf) + sizeof(D_max))
-#define BENCH_MUSIC_STATE_BYTES (sizeof(music_frame_idx) + sizeof(music_frames_collected) + \
-                                 sizeof(music_last_angle) + sizeof(music_geom_init))
-
 static float bench_algorithm_ram_kb(int algo_id) {
-    size_t bytes = 0;
+    /*
+     * RAM_KB 统计口径：算法工作区 RAM。
+     * 1. 不计入 I2S DMA、原始输入帧、7 路 FFT 共享缓存等平台固定开销；
+     * 2. TDOA 系列算法计入 GCC-PHAT 互相关缓存 shared_R_real/shared_R_imag；
+     * 3. SRP-PHAT 计入自身频域 PHAT 互谱缓存；
+     * 4. MUSIC 计入多帧频域历史缓存、谱搜索缓存和矩阵工作区。
+     * 该函数只做 sizeof / 维度级估算，不使用 malloc/free，不改变原 Python 接口。
+     */
+    float bytes = 0.0f;
+    const float fbytes = (float)sizeof(float);
 
-#if BENCH_COUNT_FRAME_IO
-    bytes += BENCH_FRAME_IO_BYTES;
-#endif
-
-#if BENCH_COUNT_SHARED_FFT
-    bytes += BENCH_SHARED_FFT_BYTES;
-#endif
+    const float pair_geom_bytes = (float)(sizeof(pair_conf) + sizeof(D_max));
+    const float gcc_xcorr_bytes = (float)(sizeof(shared_R_real) + sizeof(shared_R_imag));
 
     switch (algo_id) {
-        case 0: // TDOA-Grid：阵列几何 + GCC互相关缓存 + TDOA测量向量
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS);
-#if BENCH_COUNT_GCC_XCORR
-            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
-#endif
+        case 0: /* TDOA-Grid */
+            bytes = pair_geom_bytes + gcc_xcorr_bytes + (float)NUM_PAIRS * fbytes;
             break;
 
-        case 1: // SRP-PHAT：阵列几何 + 紧凑频带 PHAT 互谱缓存；不计入 GCC IFFT 缓存
-            bytes += BENCH_PAIR_GEOM_BYTES + sizeof(srp_R_phat_r) + sizeof(srp_R_phat_i);
+        case 1: /* SRP-PHAT: 紧凑频带互谱缓存，50~8000 Hz */
+            bytes = pair_geom_bytes + 2.0f * (float)NUM_PAIRS * (float)SRP_MAX_BINS * fbytes;
             break;
 
-        case 2: // Broadband MUSIC：MUSIC状态 + 多帧频域历史缓存 + 谱缓存 + 矩阵/向量工作区
-            bytes += BENCH_MUSIC_STATE_BYTES +
-                     sizeof(X_history_r) + sizeof(X_history_i) +
-                     sizeof(music_P_spectrum) + sizeof(music_pos_x) + sizeof(music_pos_y) +
-                     BENCH_FLOAT_BYTES(2 * NUM_MICS * NUM_MICS) +   // Rxx_r/Rxx_i
-                     BENCH_FLOAT_BYTES(2 * NUM_MICS * NUM_MICS) +   // Pn_r/Pn_i
-                     BENCH_FLOAT_BYTES(8 * NUM_MICS);               // V、V_new、a、y 等小向量
+        case 2: /* Broadband MUSIC */
+            bytes = (float)(sizeof(X_history_r) + sizeof(X_history_i))
+                  + 360.0f * fbytes
+                  + 2.0f * (float)NUM_MICS * fbytes
+                  + 4.0f * (float)NUM_MICS * (float)NUM_MICS * fbytes
+                  + 8.0f * (float)NUM_MICS * fbytes
+                  + 4.0f * fbytes;
             break;
 
-        case 3: // ADMM L1-TDOA：阵列几何 + GCC缓存 + 预计算矩阵 + tau/x/z/u 工作向量
-            bytes += BENCH_PAIR_GEOM_BYTES +
-                     sizeof(A_admm) + sizeof(AtA_inv_At) +
-                     BENCH_FLOAT_BYTES(NUM_PAIRS + 2 + NUM_PAIRS + NUM_PAIRS);
-#if BENCH_COUNT_GCC_XCORR
-            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
-#endif
+        case 3: /* ADMM L1-TDOA */
+            bytes = pair_geom_bytes + gcc_xcorr_bytes
+                  + (float)(sizeof(A_admm) + sizeof(AtA_inv_At))
+                  + (float)(NUM_PAIRS + 2 + NUM_PAIRS + NUM_PAIRS) * fbytes;
             break;
 
-        case 4: // Huber-IRLS：阵列几何 + GCC缓存 + tau_meas + Q_k
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS + NUM_PAIRS);
-#if BENCH_COUNT_GCC_XCORR
-            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
-#endif
+        case 4: /* Huber-IRLS */
+        case 5: /* MCC-TDOA */
+            bytes = pair_geom_bytes + gcc_xcorr_bytes
+                  + 2.0f * (float)NUM_PAIRS * fbytes;
             break;
 
-        case 5: // MCC-TDOA：阵列几何 + GCC缓存 + tau_meas + Q_k
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS + NUM_PAIRS);
-#if BENCH_COUNT_GCC_XCORR
-            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
-#endif
-            break;
-
-        case 6: // Proposed(MAD)：阵列几何 + GCC缓存 + Q、tau、残差、权重 + 中位数临时数组
-            bytes += BENCH_PAIR_GEOM_BYTES + BENCH_FLOAT_BYTES(NUM_PAIRS * 5);
-#if BENCH_COUNT_GCC_XCORR
-            bytes += BENCH_GCC_PAIR_BUFFER_BYTES;
-#endif
+        case 6: /* Proposed(MAD) */
+            bytes = pair_geom_bytes + gcc_xcorr_bytes
+                  + 5.0f * (float)NUM_PAIRS * fbytes
+                  + 2.0f * fbytes;
             break;
 
         default:
-            bytes = 0;
+            bytes = 0.0f;
             break;
     }
 
-    return BENCH_BYTES_TO_KB(bytes);
-}
-
-static float bench_total_deploy_ram_kb(int algo_id) {
-    // 这个函数不作为默认 Python 返回值，只用于你需要“单算法整机部署峰值 RAM”时参考。
-    // 它等价于：输入/采集缓存 + 共享FFT缓存 + 算法工作区。
-    size_t bytes = BENCH_FRAME_IO_BYTES + BENCH_SHARED_FFT_BYTES;
-    return BENCH_BYTES_TO_KB(bytes) + bench_algorithm_ram_kb(algo_id);
+    return bytes / 1024.0f;
 }
 
 // ============================================================================
@@ -389,6 +314,8 @@ static float run_tdoa_grid(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_macs) 
 static float run_srp_phat(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_macs) {
     int m, i, u, v, k, bin, theta, p;
     float window, df, max_srp_energy, best_ang, final_ang;
+    static float R_phat_r[NUM_PAIRS][SRP_MAX_BINS];
+    static float R_phat_i[NUM_PAIRS][SRP_MAX_BINS];
 
     for (m = 0; m < NUM_MICS; m++) {
         for (i = 0; i < FFT_N; i++) {
@@ -402,7 +329,7 @@ static float run_srp_phat(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_macs) {
     df = SAMPLE_RATE / FFT_N;  
     int start_bin = (int)ceilf(50.0f / df);    
     int end_bin = (int)floorf(8000.0f / df);   
-    if (end_bin - start_bin + 1 > MAX_BINS) end_bin = start_bin + MAX_BINS - 1;
+    if (end_bin - start_bin + 1 > SRP_MAX_BINS) end_bin = start_bin + SRP_MAX_BINS - 1;
 
     k = 0;
     for (u = 0; u < NUM_MICS; u++) {
@@ -412,8 +339,8 @@ static float run_srp_phat(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_macs) {
                 float cross_i = shared_mic_imag[u][bin] * shared_mic_real[v][bin] - shared_mic_real[u][bin] * shared_mic_imag[v][bin];
                 float mag = sqrtf(cross_r * cross_r + cross_i * cross_i) + 1e-9f;
                 int compact_bin = bin - start_bin;
-                srp_R_phat_r[k][compact_bin] = cross_r / mag;
-                srp_R_phat_i[k][compact_bin] = cross_i / mag;
+                R_phat_r[k][compact_bin] = cross_r / mag;
+                R_phat_i[k][compact_bin] = cross_i / mag;
             }
             k++;
         }
@@ -431,7 +358,7 @@ static float run_srp_phat(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_macs) {
                 float freq = bin * df;
                 float phase = 2.0f * PI * freq * theo_tdoa;
                 int compact_bin = bin - start_bin;
-                e_sum += (srp_R_phat_r[p][compact_bin] * cosf(phase) + srp_R_phat_i[p][compact_bin] * sinf(phase));
+                e_sum += (R_phat_r[p][compact_bin] * cosf(phase) + R_phat_i[p][compact_bin] * sinf(phase));
             }
         }
         if (e_sum > max_srp_energy) { max_srp_energy = e_sum; best_ang = (float)theta; }
@@ -457,13 +384,15 @@ static float run_broadband_music(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_
         fft_radix2(shared_mic_real[m], shared_mic_imag[m], FFT_N, 0);
     }
 
-    if (!music_geom_init) {
+    static float mic_pos_x[NUM_MICS], mic_pos_y[NUM_MICS];
+    static int geom_init = 0;
+    if (!geom_init) {
         for (i = 0; i < 6; i++) {
-            music_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
-            music_pos_y[i] = 0.04f * sinf(i * 60.0f * DEG2RAD);
+            mic_pos_x[i] = 0.04f * cosf(i * 60.0f * DEG2RAD);
+            mic_pos_y[i] = 0.04f * sinf(i * 60.0f * DEG2RAD);
         }
-        music_pos_x[6] = 0.0f; music_pos_y[6] = 0.0f;
-        music_geom_init = 1;
+        mic_pos_x[6] = 0.0f; mic_pos_y[6] = 0.0f;
+        geom_init = 1;
     }
 
     df = SAMPLE_RATE / FFT_N;
@@ -485,7 +414,8 @@ static float run_broadband_music(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_
         return music_last_angle;
     }
 
-    for (i = 0; i < 360; i++) music_P_spectrum[i] = 0.0f;
+    static float P_MUSIC[360];
+    for (i = 0; i < 360; i++) P_MUSIC[i] = 0.0f;
 
     for (bin = start_bin; bin <= end_bin; bin++) {
         float freq = bin * df;
@@ -533,7 +463,7 @@ static float run_broadband_music(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_
         for (theta = -180; theta < 180; theta++) {
             float a_r[NUM_MICS], a_i[NUM_MICS], cos_t = cosf(theta * DEG2RAD), sin_t = sinf(theta * DEG2RAD);
             for (m = 0; m < NUM_MICS; m++) {
-                float phase = omega * (music_pos_x[m] * cos_t + music_pos_y[m] * sin_t) / SOUND_SPEED;
+                float phase = omega * (mic_pos_x[m] * cos_t + mic_pos_y[m] * sin_t) / SOUND_SPEED;
                 a_r[m] = cosf(phase); a_i[m] = -sinf(phase); 
             }
             float y_r[NUM_MICS] = {0}, y_i[NUM_MICS] = {0}, val_r = 0.0f;
@@ -542,12 +472,12 @@ static float run_broadband_music(float mic_data[NUM_MICS][FFT_N], uint32_t *dyn_
                 y_i[i] += (Pn_r[i][j] * a_i[j] + Pn_i[i][j] * a_r[j]);
             }
             for (i = 0; i < NUM_MICS; i++) val_r += (a_r[i] * y_r[i] + a_i[i] * y_i[i]);
-            music_P_spectrum[theta + 180] += 1.0f / (val_r + 1e-12f);
+            P_MUSIC[theta + 180] += 1.0f / (val_r + 1e-12f);
         }
     }
 
     float max_P = 0, best_ang = 0;
-    for (i = 0; i < 360; i++) if (music_P_spectrum[i] > max_P) { max_P = music_P_spectrum[i]; best_ang = (float)(i - 180); }
+    for (i = 0; i < 360; i++) if (P_MUSIC[i] > max_P) { max_P = P_MUSIC[i]; best_ang = (float)(i - 180); }
     music_last_angle = best_ang;
     
     float final_ang = fmodf(best_ang + 180.0f, 360.0f);
@@ -999,8 +929,6 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(mp_obj_t algo_id_obj) {
 
     float angle_out = 0.0f;
     uint32_t macs_out = 0;
-    // 保持原接口不变：第三个返回值仍为 RAM_KB。
-    // 但 RAM_KB 不再手写常数，而是由 sizeof() 统一计算算法工作区 RAM；TDOA 系列会计入 GCC 互相关缓存。
     float ram_kb_out = bench_algorithm_ram_kb(algo_id);
 
     // 5. 纯净计算耗时起点
@@ -1009,31 +937,24 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(mp_obj_t algo_id_obj) {
     // 根据上层传入的 algo_id 路由至对应算法，注入动态 MACs
     switch (algo_id) {
         case 0: 
-            
             angle_out = run_tdoa_grid(mic_raw_float, &macs_out); 
             break;
         case 1: 
-            
             angle_out = run_srp_phat(mic_raw_float, &macs_out); 
             break;
         case 2: 
-            
             angle_out = run_broadband_music(mic_raw_float, &macs_out); 
             break;
         case 3: 
-            
             angle_out = run_admm_l1(mic_raw_float, &macs_out); 
             break;
         case 4: 
-            
             angle_out = run_huber_irls(mic_raw_float, &macs_out); 
             break;
         case 5: 
-            
             angle_out = run_mcc_tdoa(mic_raw_float, &macs_out); 
             break;
         case 6: 
-            
             angle_out = run_proposed_mad(mic_raw_float, &macs_out); 
             break;
         default: 
@@ -1045,7 +966,7 @@ STATIC mp_obj_t Maix_mic_array_get_benchmark(mp_obj_t algo_id_obj) {
     uint64_t end_time_us = sysctl_get_time_us();
     float cost_ms = (float)(end_time_us - start_time_us) / 1000.0f;
 
-    // 返回 4 维 Tuple 给 Python 层：cost_ms, macs, ram_kb, angle；旧接口不变
+    // 返回 4 维 Tuple 给 Python 层
     mp_obj_t tuple[4];
     tuple[0] = mp_obj_new_float(cost_ms);     
     tuple[1] = mp_obj_new_int(macs_out);      
